@@ -1,0 +1,5 @@
+Inference server label: bin
+CLIP best label: mechanical part
+CLIP score: 0.2816
+CLIP top labels: ['mechanical part', 'box', 'skis', 'table', 'toothbrush']
+CLIP top scores: ['0.2816', '0.1254', '0.0827', '0.0692', '0.0611']

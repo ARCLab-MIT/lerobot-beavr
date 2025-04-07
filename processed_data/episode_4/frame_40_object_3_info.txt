@@ -1,0 +1,5 @@
+Inference server label: robot
+CLIP best label: robot
+CLIP score: 0.7065
+CLIP top labels: ['robot', 'tennis racket', 'gear', 'human', 'tool']
+CLIP top scores: ['0.7065', '0.2086', '0.0175', '0.0132', '0.0094']

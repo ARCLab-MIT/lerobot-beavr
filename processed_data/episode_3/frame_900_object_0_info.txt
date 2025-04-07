@@ -1,0 +1,5 @@
+Inference server label: box
+CLIP best label: snowboard
+CLIP score: 0.2356
+CLIP top labels: ['snowboard', 'skis', 'tv', 'baseball bat', 'tennis racket']
+CLIP top scores: ['0.2356', '0.2046', '0.0425', '0.0320', '0.0312']

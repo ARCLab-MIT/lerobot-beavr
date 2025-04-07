@@ -1,0 +1,5 @@
+# API key for Roboflow
+roboflow_api_key: "gCqZi81mrMIb9yQDnfqK"
+
+# Path to custom YOLOv12 model
+yolov12_model_path: "https://app.roboflow.com/lga-act/lga-koch-arm-object-detector/1"

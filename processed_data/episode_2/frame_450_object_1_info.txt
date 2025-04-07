@@ -1,0 +1,5 @@
+Inference server label: box
+CLIP best label: electronic device
+CLIP score: 0.1480
+CLIP top labels: ['electronic device', 'box', 'cell phone', 'scissors', 'mechanical part']
+CLIP top scores: ['0.1480', '0.1398', '0.0937', '0.0711', '0.0687']

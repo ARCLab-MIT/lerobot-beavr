@@ -1,0 +1,5 @@
+Inference server label: bin
+CLIP best label: table
+CLIP score: 0.1178
+CLIP top labels: ['table', 'microwave', 'mechanical part', 'dining table', 'cup']
+CLIP top scores: ['0.1178', '0.0699', '0.0677', '0.0610', '0.0586']

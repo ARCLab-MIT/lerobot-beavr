@@ -1,0 +1,5 @@
+Inference server label: box
+CLIP best label: box
+CLIP score: 0.1406
+CLIP top labels: ['box', 'electronic device', 'robot', 'microwave', 'remote']
+CLIP top scores: ['0.1406', '0.1264', '0.0974', '0.0933', '0.0748']
