@@ -1,5 +1,0 @@
-Inference server label: box
-CLIP best label: tv
-CLIP score: 0.0905
-CLIP top labels: ['tv', 'keyboard', 'tennis racket', 'skis', 'baseball bat']
-CLIP top scores: ['0.0905', '0.0662', '0.0564', '0.0544', '0.0543']

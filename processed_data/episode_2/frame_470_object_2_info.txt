@@ -1,5 +1,0 @@
-Inference server label: box
-CLIP best label: train
-CLIP score: 0.3101
-CLIP top labels: ['train', 'bus', 'box', 'electronic device', 'tv']
-CLIP top scores: ['0.3101', '0.1174', '0.0564', '0.0519', '0.0328']

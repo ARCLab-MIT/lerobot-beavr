@@ -1,5 +1,0 @@
-Inference server label: robot
-CLIP best label: robot
-CLIP score: 0.9173
-CLIP top labels: ['robot', 'mechanical part', 'electronic device', 'human', 'tool']
-CLIP top scores: ['0.9173', '0.0316', '0.0110', '0.0092', '0.0071']

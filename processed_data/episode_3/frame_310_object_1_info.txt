@@ -1,5 +1,0 @@
-Inference server label: bin
-CLIP best label: box
-CLIP score: 0.2604
-CLIP top labels: ['box', 'bin', 'microwave', 'table', 'mechanical part']
-CLIP top scores: ['0.2604', '0.1207', '0.0848', '0.0619', '0.0484']

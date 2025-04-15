@@ -1,5 +1,0 @@
-Inference server label: bin
-CLIP best label: mechanical part
-CLIP score: 0.2483
-CLIP top labels: ['mechanical part', 'box', 'skis', 'toothbrush', 'table']
-CLIP top scores: ['0.2483', '0.1327', '0.1050', '0.0786', '0.0631']
