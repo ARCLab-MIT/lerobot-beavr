@@ -1,0 +1,21 @@
+{
+    "dataset": {
+        "repo_id": "aposadasn/lander18"
+    },
+    "policy": {
+        "type": "act",
+        "device": "cuda",
+        "input_features": {
+            "observation.state": "STATE",
+            "observation.images": "VISUAL"
+        },
+        "output_features": {
+            "action": "ACTION"
+        }
+    },
+    "output_dir": "outputs/train/lander",
+    "job_name": "lander",
+    "wandb": {
+        "enable": true
+    }
+}

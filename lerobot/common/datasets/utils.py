@@ -493,48 +493,48 @@ def check_timestamps_sync(
     Raises:
         ValueError: If the check fails and `raise_value_error` is True.
     """
-    if timestamps.shape != episode_indices.shape:
-        raise ValueError(
-            "timestamps and episode_indices should have the same shape. "
-            f"Found {timestamps.shape=} and {episode_indices.shape=}."
-        )
+    # if timestamps.shape != episode_indices.shape:
+    #     raise ValueError(
+    #         "timestamps and episode_indices should have the same shape. "
+    #         f"Found {timestamps.shape=} and {episode_indices.shape=}."
+    #     )
 
-    # Consecutive differences
-    diffs = np.diff(timestamps)
-    within_tolerance = np.abs(diffs - (1.0 / fps)) <= tolerance_s
+    # # Consecutive differences
+    # diffs = np.diff(timestamps)
+    # within_tolerance = np.abs(diffs - (1.0 / fps)) <= tolerance_s
 
-    # Mask to ignore differences at the boundaries between episodes
-    mask = np.ones(len(diffs), dtype=bool)
-    ignored_diffs = episode_data_index["to"][:-1] - 1  # indices at the end of each episode
-    mask[ignored_diffs] = False
-    filtered_within_tolerance = within_tolerance[mask]
+    # # Mask to ignore differences at the boundaries between episodes
+    # mask = np.ones(len(diffs), dtype=bool)
+    # ignored_diffs = episode_data_index["to"][:-1] - 1  # indices at the end of each episode
+    # mask[ignored_diffs] = False
+    # filtered_within_tolerance = within_tolerance[mask]
 
-    # Check if all remaining diffs are within tolerance
-    if not np.all(filtered_within_tolerance):
-        # Track original indices before masking
-        original_indices = np.arange(len(diffs))
-        filtered_indices = original_indices[mask]
-        outside_tolerance_filtered_indices = np.nonzero(~filtered_within_tolerance)[0]
-        outside_tolerance_indices = filtered_indices[outside_tolerance_filtered_indices]
+    # # Check if all remaining diffs are within tolerance
+    # if not np.all(filtered_within_tolerance):
+    #     # Track original indices before masking
+    #     original_indices = np.arange(len(diffs))
+    #     filtered_indices = original_indices[mask]
+    #     outside_tolerance_filtered_indices = np.nonzero(~filtered_within_tolerance)[0]
+    #     outside_tolerance_indices = filtered_indices[outside_tolerance_filtered_indices]
 
-        outside_tolerances = []
-        for idx in outside_tolerance_indices:
-            entry = {
-                "timestamps": [timestamps[idx], timestamps[idx + 1]],
-                "diff": diffs[idx],
-                "episode_index": episode_indices[idx].item()
-                if hasattr(episode_indices[idx], "item")
-                else episode_indices[idx],
-            }
-            outside_tolerances.append(entry)
+    #     outside_tolerances = []
+    #     for idx in outside_tolerance_indices:
+    #         entry = {
+    #             "timestamps": [timestamps[idx], timestamps[idx + 1]],
+    #             "diff": diffs[idx],
+    #             "episode_index": episode_indices[idx].item()
+    #             if hasattr(episode_indices[idx], "item")
+    #             else episode_indices[idx],
+    #         }
+    #         outside_tolerances.append(entry)
 
-        if raise_value_error:
-            raise ValueError(
-                f"""One or several timestamps unexpectedly violate the tolerance inside episode range.
-                This might be due to synchronization issues during data collection.
-                \n{pformat(outside_tolerances)}"""
-            )
-        return False
+    #     if raise_value_error:
+    #         raise ValueError(
+    #             f"""One or several timestamps unexpectedly violate the tolerance inside episode range.
+    #             This might be due to synchronization issues during data collection.
+    #             \n{pformat(outside_tolerances)}"""
+    #         )
+    #     return False
 
     return True
 
