@@ -19,6 +19,7 @@ wandb
 
 # Data
 data
+datasets
 outputs
 
 # Apple

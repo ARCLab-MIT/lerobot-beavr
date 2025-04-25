@@ -83,7 +83,7 @@ class ObjectDetector:
         else:
             raise ValueError("inference_server_url must be provided to use the inference server.")
     
-    def detect_and_segment(self, image, text_prompt=None, box_threshold=0.25):
+    def detect_and_segment(self, image, text_prompt=None, box_threshold=0.51):
         """
         Detect and segment objects in an image using the inference server.
         

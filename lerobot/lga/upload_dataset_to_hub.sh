@@ -1,0 +1,1 @@
+huggingface-cli upload arclabmit/koch_gearbin_augmented_dataset ./datasets/koch_augmented . --repo-type dataset

@@ -287,6 +287,7 @@ class ManipulatorRobot:
 
         # Connect the cameras
         for name in self.cameras:
+            print(f"Connecting {name} camera (index: {self.cameras[name].camera_index})...")
             self.cameras[name].connect()
 
         self.is_connected = True
