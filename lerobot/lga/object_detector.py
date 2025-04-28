@@ -196,3 +196,15 @@ class ObjectDetector:
                 filtered_labels.append(label)
                 filtered_masks.append(masks[i])
         return filtered_boxes, filtered_labels, filtered_masks
+    
+if __name__ == "__main__":
+    import cv2
+    # Initialize detector and masker
+    detector = ObjectDetector(
+        debug=True,
+        inference_server_url="http://localhost:9001",
+        roboflow_api_key="gCqZi81mrMIb9yQDnfqK"
+    )
+    image = cv2.imread("/home/demo/Pictures/Screenshots/test.png")
+    results = detector.detect_and_segment(image)
+    print(results)

@@ -220,7 +220,7 @@ class KochRobotConfig(ManipulatorRobotConfig):
     leader_arms: dict[str, MotorsBusConfig] = field(
         default_factory=lambda: {
             "main": DynamixelMotorsBusConfig(
-                port="/dev/ttyACM6",
+                port="/dev/ttyACM1",
                 motors={
                     # name: (index, model)
                     "shoulder_pan": [1, "xl330-m077"],
@@ -237,7 +237,7 @@ class KochRobotConfig(ManipulatorRobotConfig):
     follower_arms: dict[str, MotorsBusConfig] = field(
         default_factory=lambda: {
             "main": DynamixelMotorsBusConfig(
-                port="/dev/ttyACM5",
+                port="/dev/ttyACM0",
                 motors={
                     # name: (index, model)
                     "shoulder_pan": [1, "xl430-w250"],
@@ -254,13 +254,13 @@ class KochRobotConfig(ManipulatorRobotConfig):
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "front": OpenCVCameraConfig(
-                camera_index=9,
+                camera_index=4,
                 fps=30,
                 width=640,
                 height=480,
             ),
             "overhead": OpenCVCameraConfig(
-                camera_index=0,
+                camera_index=6,
                 fps=30,
                 width=640,
                 height=480,

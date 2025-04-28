@@ -10,6 +10,7 @@ import argparse
 import av
 import numpy as np
 from tqdm import tqdm
+from fractions import Fraction
 from lerobot.lga.object_detector import ObjectDetector
 from lerobot.lga.frame_masker import FrameMasker
 
@@ -87,7 +88,7 @@ def process_video_with_pyav(input_path, output_path, detector, frame_masker, sta
 
     # Create output video with same fps and resolution
     output = av.open(output_path, mode='w')
-    out_stream = output.add_stream('h264', rate=fps)
+    out_stream = output.add_stream('h264', rate=Fraction(int(fps * 1000), 1000))
     out_stream.width = width
     out_stream.height = height
     out_stream.pix_fmt = 'yuv420p'
@@ -149,7 +150,7 @@ def main():
         help="Maximum number of videos to process per camera"
     )
     parser.add_argument(
-        "--debug", action="store_true", default=True,
+        "--debug", action="store_true", default=False,
         help="Enable debug logging"
     )
     args = parser.parse_args()
