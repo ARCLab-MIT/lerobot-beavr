@@ -261,11 +261,19 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
     a channel last representation (h w c) of uint8 type, to a torch image representation
     with channel first (c h w) of float32 type in range [0,1].
     """
+    import io
+    from PIL import Image as PILImage
+    from torchvision import transforms
+
     for key in items_dict:
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
             to_tensor = transforms.ToTensor()
             items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+        elif isinstance(first_item, (bytes, bytearray)):
+            # NEW: decode PNG bytes to PIL, then to tensor
+            to_tensor = transforms.ToTensor()
+            items_dict[key] = [to_tensor(PILImage.open(io.BytesIO(x))) for x in items_dict[key]]
         elif first_item is None:
             pass
         else:

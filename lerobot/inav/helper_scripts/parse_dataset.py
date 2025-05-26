@@ -1,28 +1,10 @@
-#!/usr/bin/env python
-
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-import os
 import json
 import shutil
 import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Any
-import torch
+from typing import Dict, List, Tuple, Optional, Union
 from PIL import Image
 import datasets
 from tqdm import tqdm
@@ -92,8 +74,9 @@ class CSVToLeRobotDatasetConverter:
         csv_pattern: str = "trajectory_{episode}.csv",
         use_videos: bool = False,
         debug: bool = False,
-        image_height: int = 256,
-        image_width: int = 256,
+        image_height: int = 480,
+        image_width: int = 640,
+        robot_type: str = "inav",
     ):
         """
         Initialize the converter.
@@ -114,6 +97,7 @@ class CSVToLeRobotDatasetConverter:
             debug: Whether to enable debug logging
             image_height: Height of images in pixels
             image_width: Width of images in pixels
+            robot_type: Type of robot
         """
         self.csv_dir = Path(csv_dir)
         self.image_dir = Path(image_dir)
@@ -138,6 +122,7 @@ class CSVToLeRobotDatasetConverter:
         self.features = {}
         self.stats = {}
         self.episodes_stats = {}
+        self.robot_type = robot_type
         
         # Set up logging
         if debug:
@@ -348,196 +333,180 @@ class CSVToLeRobotDatasetConverter:
         Returns:
             Restructured DataFrame
         """
-        # Create a new dictionary to hold the restructured data
+        # Create a new DataFrame with the required structure
         restructured_data = {}
         
-        # Process each feature
-        for feature_name, feature_info in self.features.items():
-            # Skip the image feature, as it will be handled separately
-            if feature_name == self.image_key:
-                continue
-            
-            # Get the column names for this feature
-            column_names = feature_info.get("names", [])
-            
-            # Check if all columns exist in the DataFrame
-            if all(col in df.columns for col in column_names):
-                # Extract the columns for this feature
-                feature_data = df[column_names].values
-                
-                # Ensure the feature data is properly shaped
-                if len(column_names) == 1:
-                    # For single-column features, ensure they're 1D arrays
-                    restructured_data[feature_name] = feature_data.flatten()
-                else:
-                    # For multi-column features, ensure each row is a separate entry
-                    restructured_data[feature_name] = [row for row in feature_data]
-            else:
-                # Feature not found in CSV, create placeholder
-                logger.warning(f"Feature {feature_name} not found in CSV file. Creating placeholder.")
-                
-                # Create placeholder data based on feature shape
-                shape = feature_info.get("shape", (1,))
-                
-                if len(shape) == 1 and shape[0] == 1:
-                    # For scalar features, create a 1D array of zeros
-                    restructured_data[feature_name] = np.zeros(len(df), dtype=np.float32)
-                else:
-                    # For vector features, create a list of zero arrays
-                    restructured_data[feature_name] = [np.zeros(shape, dtype=np.float32) for _ in range(len(df))]
+        # Extract observation.state columns in the correct order
+        state_columns = ["x", "y", "z", "vx", "vy", "vz", "q0", "q1", "q2", "q3", "w1", "w2", "w3"]
         
-        # Add task information
-        restructured_data["task"] = [self.task_name] * len(df)
+        # Create observation.state sequences
+        observation_states = []
+        for _, row in df.iterrows():
+            state_values = []
+            for col in state_columns:
+                # Use the column name from the CSV file
+                state_values.append(float(row[col]))
+            observation_states.append(state_values)
+        
+        restructured_data["observation.state"] = observation_states
+        
+        # Extract action columns in the correct order
+        action_columns = ["Tx", "Ty", "Tz", "Lx", "Ly", "Lz"]
+        
+        # Create action sequences
+        actions = []
+        for _, row in df.iterrows():
+            action_values = []
+            for col in action_columns:
+                # Use the column name from the CSV file
+                action_values.append(float(row[col]))
+            actions.append(action_values)
+        
+        restructured_data["action"] = actions
+        
+        # Add other required columns
+        restructured_data["timestamp"] = df["time"].values
+        restructured_data["frame_index"] = df["frame_index"].values
+        restructured_data["episode_index"] = df["episode_index"].values
+        restructured_data["index"] = df["index"].values
+        restructured_data["task_index"] = df["task_index"].values
         
         # Create the restructured DataFrame
-        restructured_df = pd.DataFrame({
-            k: v for k, v in restructured_data.items()
-        })
+        restructured_df = pd.DataFrame(restructured_data)
         
         return restructured_df
 
-    def _compute_episode_stats(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _calculate_statistics(self, all_dfs: Dict[int, pd.DataFrame]) -> None:
         """
-        Compute statistics for an episode.
+        Calculate statistics for each episode using the compute_stats module.
+        Assumes DataFrames in all_dfs have image paths relative to self.output_dir if images are used.
         
         Args:
-            df: DataFrame for the episode
-            
-        Returns:
-            Dictionary of statistics
+            all_dfs: Dictionary mapping episode indices to DataFrames
         """
-        stats = {}
+        from lerobot.common.datasets.compute_stats import compute_episode_stats
         
-        # Compute statistics for each numeric feature
-        for column in df.columns:
-            if column == "task":
-                continue  # Skip non-numeric columns
+        logger.info("Calculating episode statistics...")
+        
+        self.episodes_stats = {}
+        
+        features = {
+            "observation.state": {"dtype": "float32"},
+            "action": {"dtype": "float32"},
+            "timestamp": {"dtype": "float32"},
+            "frame_index": {"dtype": "int64"},
+            "episode_index": {"dtype": "int64"},
+            "index": {"dtype": "int64"},
+            "task_index": {"dtype": "int64"}
+        }
+
+        if not self.use_videos and self.image_key:
+            features[self.image_key] = {"dtype": "image"}
+        
+        for episode_index, df in tqdm(all_dfs.items(), desc="Calculating Episode Statistics"):
+            episode_data = {}
+            
+            # Extract observation.state data
+            if "observation.state" in df.columns:
+                episode_data["observation.state"] = df["observation.state"].values
+            else:
+                # Try to construct from individual state columns
+                state_columns = ["x", "y", "z", "vx", "vy", "vz", "q0", "q1", "q2", "q3", "w1", "w2", "w3"]
+                if all(col in df.columns for col in state_columns):
+                    episode_data["observation.state"] = df[state_columns].values
+                else:
+                    logger.warning(f"State columns not found for episode {episode_index}. Using restructured data.")
+                    # Use the restructured data if available
+                    if "observation.state" in df.columns:
+                        episode_data["observation.state"] = _ensure_minimum_ndim(df["observation.state"].values)
+            
+            # Extract action data
+            if "action" in df.columns:
+                episode_data["action"] = df["action"].values
+            else:
+                # Try to construct from individual action columns
+                action_columns = ["Tx", "Ty", "Tz", "Lx", "Ly", "Lz"]
+                if all(col in df.columns for col in action_columns):
+                    episode_data["action"] = df[action_columns].values
+                else:
+                    logger.warning(f"Action columns not found for episode {episode_index}. Skipping action stats.")
+            
+            # Add other required columns
+            for col in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+                if col in df.columns:
+                    episode_data[col] = df[col].values
+            
+            if not self.use_videos and self.image_key:
+                # Fix: Use the correct path structure for images
+                try:
+                    # Create paths to the organized images
+                    chunk_index = episode_index // self.chunk_size
+                    episode_dir = f"episode_{episode_index:06d}"
+                    image_paths = []
+                    
+                    # Get frame count from the DataFrame
+                    frame_count = len(df)
+                    
+                    # Generate paths for all frames
+                    for frame_index in range(frame_count):
+                        # Fix: Use the correct path structure that matches _organize_images method
+                        image_path = self.output_dir / "images" / f"chunk-{chunk_index:03d}" / self.image_key / episode_dir / f"frame_{frame_index:06d}{self.image_extension}"
+                        
+                        # Check if the file exists before adding it
+                        if image_path.exists():
+                            image_paths.append(str(image_path))
+                        else:
+                            # Try with absolute path
+                            abs_path = image_path.resolve()
+                            if abs_path.exists():
+                                image_paths.append(str(abs_path))
+                    
+                    if image_paths:
+                        episode_data[self.image_key] = image_paths
+                        logger.debug(f"Found {len(image_paths)} images for episode {episode_index}")
+                    else:
+                        logger.warning(f"No image paths found for episode {episode_index}. Skipping image stats.")
+                        # Create a dummy image path to avoid errors
+                        dummy_image = Image.new('RGB', (self.image_width, self.image_height), color='black')
+                        dummy_path = self.output_dir / f"dummy_image_{episode_index}.png"
+                        dummy_image.save(dummy_path)
+                        episode_data[self.image_key] = [str(dummy_path)]
+                except Exception as e:
+                    logger.warning(f"Error generating image paths for episode {episode_index}: {e}")
             
             try:
-                values = df[column].values
-                if isinstance(values, np.ndarray) and values.size > 0:
-                    stats[column] = {
-                        "mean": np.mean(values, axis=0),
-                        "std": np.std(values, axis=0),
-                        "min": np.min(values, axis=0),
-                        "max": np.max(values, axis=0),
-                    }
+                if episode_data:  # Only compute stats if we have data
+                    # Ensure all arrays are at least 1D
+                    episode_data = _ensure_minimum_ndim(episode_data)
+                    self.episodes_stats[episode_index] = compute_episode_stats(episode_data, features)
+                else:
+                    logger.warning(f"No data available for episode {episode_index}. Skipping stats.")
+                    self.episodes_stats[episode_index] = {}
             except Exception as e:
-                logger.warning(f"Failed to compute statistics for {column}: {e}")
-        
-        return stats
+                logger.error(f"Error computing stats for episode {episode_index}: {e}")
+                self.episodes_stats[episode_index] = {}
 
-    def _aggregate_stats(self, episode_stats: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Aggregate statistics across all episodes.
-        
-        Args:
-            episode_stats: List of episode statistics
-            
-        Returns:
-            Aggregated statistics
-        """
-        if not episode_stats:
-            return {}
-        
-        # Initialize aggregated stats with the first episode's stats
-        aggregated_stats = {}
-        
-        # Get all keys from all episodes
-        all_keys = set()
-        for stats in episode_stats:
-            all_keys.update(stats.keys())
-        
-        # Aggregate statistics for each key
-        for key in all_keys:
-            # Collect statistics for this key from all episodes
-            key_stats = []
-            for stats in episode_stats:
-                if key in stats:
-                    key_stats.append(stats[key])
-            
-            if not key_stats:
-                continue
-            
-            # Initialize aggregated stats for this key
-            aggregated_stats[key] = {}
-            
-            # Aggregate each statistic
-            for stat_name in ["mean", "std", "min", "max"]:
-                try:
-                    # Collect values for this statistic from all episodes
-                    values = [stats[stat_name] for stats in key_stats if stat_name in stats]
-                    if not values:
-                        continue
-                    
-                    # Convert to numpy arrays
-                    values = [np.array(value) for value in values]
-                    
-                    # Aggregate
-                    if stat_name == "mean":
-                        # Weighted average of means
-                        weights = np.array([value.size for value in values])
-                        aggregated_stats[key][stat_name] = np.average(values, weights=weights, axis=0)
-                    elif stat_name == "std":
-                        # Pooled standard deviation
-                        weights = np.array([value.size for value in values])
-                        aggregated_stats[key][stat_name] = np.sqrt(np.average(np.square(values), weights=weights, axis=0))
-                    elif stat_name == "min":
-                        # Minimum of minimums
-                        aggregated_stats[key][stat_name] = np.min(values, axis=0)
-                    elif stat_name == "max":
-                        # Maximum of maximums
-                        aggregated_stats[key][stat_name] = np.max(values, axis=0)
-                except Exception as e:
-                    logger.warning(f"Failed to aggregate {stat_name} for {key}: {e}")
-        
-        return aggregated_stats
+        logger.info(f"Calculated statistics for {len(self.episodes_stats)} episodes")
 
-    def _create_hf_features(self) -> Dict[str, Any]:
-        """
-        Create HuggingFace features for the dataset.
+    def _create_hf_features(self) -> datasets.Features:
+        """Create HuggingFace features dictionary."""
+        import datasets
         
-        Returns:
-            Dictionary of HuggingFace features
-        """
-        # Define the features
-        hf_features = {
-            "position": datasets.Features.Sequence(datasets.Value("float32"), length=3),
-            "velocity": datasets.Features.Sequence(datasets.Value("float32"), length=3),
-            "attitude": datasets.Features.Sequence(datasets.Value("float32"), length=4),
-            "angular_velocity": datasets.Features.Sequence(datasets.Value("float32"), length=3),
-            "action": datasets.Features.Sequence(datasets.Value("float32"), length=6),
+        feature_dict = {
+            "action": datasets.Sequence(datasets.Value("float32")),
+            "observation.state": datasets.Sequence(datasets.Value("float32")),
             "timestamp": datasets.Value("float32"),
             "frame_index": datasets.Value("int64"),
             "episode_index": datasets.Value("int64"),
-            "task_index": datasets.Value("int64"),
             "index": datasets.Value("int64"),
-            "task": datasets.Value("string"),
-        }
-        
-        # Update the features dictionary
-        self.features = {
-            "position": {"dtype": "float32", "shape": (3,), "names": ["x", "y", "z"]},
-            "velocity": {"dtype": "float32", "shape": (3,), "names": ["v_x", "v_y", "v_z"]},
-            "attitude": {"dtype": "float32", "shape": (4,), "names": ["q0", "q1", "q2", "q3"]},
-            "angular_velocity": {"dtype": "float32", "shape": (3,), "names": ["w1", "w2", "w3"]},
-            "action": {"dtype": "float32", "shape": (6,), "names": ["T_x", "T_y", "T_z", "L_x", "L_y", "L_z"]},
-            "timestamp": {"dtype": "float32", "shape": (1,), "names": ["timestamp"]},
-            "frame_index": {"dtype": "int64", "shape": (1,), "names": ["frame_index"]},
-            "episode_index": {"dtype": "int64", "shape": (1,), "names": ["episode_index"]},
-            "task_index": {"dtype": "int64", "shape": (1,), "names": ["task_index"]},
-            "index": {"dtype": "int64", "shape": (1,), "names": ["index"]},
+            "task_index": datasets.Value("int64"),
         }
         
         # Add image feature if using images
-        if self.image_key:
-            self.features[self.image_key] = {
-                "dtype": "image",
-                "shape": (3, self.image_height, self.image_width),
-                "names": ["channels", "height", "width"]
-            }
+        if self.use_videos and self.image_key:
+            feature_dict[self.image_key] = datasets.Image()
         
-        return hf_features
+        return datasets.Features(feature_dict)
 
     def _create_metadata(self, csv_files: List[Tuple[int, Path]], episode_lengths: List[int]) -> None:
         """Create metadata files for the dataset."""
@@ -545,48 +514,79 @@ class CSVToLeRobotDatasetConverter:
         meta_dir = self.output_dir / "meta"
         meta_dir.mkdir(parents=True, exist_ok=True)
         
-        # Compute statistics for all episodes
-        all_episode_stats = {}
-        for episode_index, csv_path in tqdm(csv_files, desc="Computing episode statistics"):
-            # Read the CSV file and process it first to add frame_index
-            df = pd.read_csv(csv_path)
-            df = self._process_csv_file(episode_index, csv_path)
-            
-            # Now restructure the processed dataframe
-            restructured_df = self._restructure_dataframe(df)
-            episode_stats = self._compute_episode_stats(restructured_df)
-            all_episode_stats[episode_index] = episode_stats
-            self.episodes_stats[episode_index] = episode_stats
-        
-        # Aggregate statistics across all episodes
-        self.stats = self._aggregate_stats(list(all_episode_stats.values()))
-        
         # Create info.json
         info = {
             "codebase_version": "v2.1",
-            "data_path": DEFAULT_PARQUET_PATH.replace("{chunk_index}", "{episode_chunk:03d}").replace("{episode_id}", "{episode_index:06d}"),
-            "video_path": DEFAULT_VIDEO_PATH.replace("{chunk_index}", "{episode_chunk:03d}").replace("{episode_id}", "{episode_index:06d}") if self.use_videos else None,
-            "features": self.features,
+            "robot_type": self.robot_type,
             "fps": self.fps,
-            "robot_type": "unknown",  # Set to unknown for generic datasets
             "total_episodes": len(csv_files),
             "total_frames": sum(episode_lengths),
-            "total_tasks": 1,  # Only one task for all episodes
+            "total_tasks": 1,
+            "total_videos": len(csv_files) if self.use_videos else 0,
             "total_chunks": (len(csv_files) + self.chunk_size - 1) // self.chunk_size,
             "chunks_size": self.chunk_size,
-            "total_videos": len(csv_files) if self.use_videos else 0,
             "splits": {"train": f"0:{len(csv_files)}"},
-        }
-        
-        # Add video info if using videos
-        if self.use_videos and self.image_key in self.features:
-            self.features[self.image_key]["video_info"] = {
-                "video.fps": float(self.fps),
-                "video.codec": "h264",
-                "video.pix_fmt": "yuv420p",
-                "video.is_depth_map": False,
-                "has_audio": False
+            "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+            "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4" if self.use_videos else None,
+            "image_path": "images/chunk-{episode_chunk:03d}/{image_key}/episode_{episode_index:06d}/frame_{frame_index:06d}.png" if not self.use_videos else None,
+            "features": {
+                "observation.images.cam": {
+                    "dtype": "video" if self.use_videos else "image",
+                    "shape": [3, self.image_height, self.image_width],
+                    "names": ["channels", "height", "width"],
+                    "video_info": {
+                        "video.fps": self.fps,
+                        "video.height": self.image_height,
+                        "video.width": self.image_width,
+                        "video.channels": 3,
+                        "video.codec": "av1",
+                        "video.pix_fmt": "yuv420p",
+                        "video.is_depth_map": False,
+                        "has_audio": False
+                    } if self.use_videos else None
+                },
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": [13],
+                    "names": [
+                        "x", "y", "z",
+                        "vx", "vy", "vz",
+                        "q0", "q1", "q2", "q3",
+                        "w1", "w2", "w3"
+                    ]
+                },
+                "action": {
+                    "dtype": "float32",
+                    "shape": [6],
+                    "names": ["Tx", "Ty", "Tz", "Lx", "Ly", "Lz"]
+                },
+                "timestamp": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "names": None
+                },
+                "frame_index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": None
+                },
+                "episode_index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": None
+                },
+                "task_index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": None
+                },
+                "index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": None
+                }
             }
+        }
         
         # Helper function to convert numpy arrays to Python types
         def convert_numpy_to_python(obj):
@@ -603,31 +603,27 @@ class CSVToLeRobotDatasetConverter:
             else:
                 return obj
         
-        # Write metadata files directly to the meta directory
+        # Write info.json
         with open(meta_dir / "info.json", "w") as f:
             json.dump(convert_numpy_to_python(info), f, indent=2)
         
-        # Create tasks.jsonl
+        # Create tasks.jsonl (single line)
         with open(meta_dir / "tasks.jsonl", "w") as f:
-            task_dict = {
+            task_data = {
                 "task_index": 0,
-                "task": self.task_name,
+                "task": self.task_name
             }
-            f.write(json.dumps(task_dict) + "\n")
+            f.write(json.dumps(task_data) + "\n")
         
         # Create episodes.jsonl
         with open(meta_dir / "episodes.jsonl", "w") as f:
             for episode_index, _ in csv_files:
-                episode_dict = {
+                episode_data = {
                     "episode_index": episode_index,
                     "tasks": [self.task_name],
-                    "length": episode_lengths[episode_index],
+                    "length": episode_lengths[episode_index]
                 }
-                f.write(json.dumps(episode_dict) + "\n")
-        
-        # Create stats.json
-        with open(meta_dir / "stats.json", "w") as f:
-            json.dump(convert_numpy_to_python(self.stats), f, indent=2)
+                f.write(json.dumps(episode_data) + "\n")
         
         # Create episodes_stats.jsonl
         with open(meta_dir / "episodes_stats.jsonl", "w") as f:
@@ -639,9 +635,8 @@ class CSVToLeRobotDatasetConverter:
                 f.write(json.dumps(episode_stats_dict) + "\n")
         
         # Create image_keys.json to explicitly define image keys
-        if self.image_key:
-            with open(meta_dir / "image_keys.json", "w") as f:
-                json.dump([self.image_key], f, indent=2)
+        with open(meta_dir / "image_keys.json", "w") as f:
+            json.dump(["observation.images.cam"], f, indent=2)
 
     def _embed_images(self, dataset: datasets.Dataset) -> datasets.Dataset:
         """
@@ -656,6 +651,111 @@ class CSVToLeRobotDatasetConverter:
         # This is a placeholder for future implementation
         # Currently, images are stored as separate files and not embedded in the dataset
         return dataset
+
+    def _process_chunk(self, chunk_index: int, episodes: List[Tuple[int, Path]]) -> None:
+        """Process a chunk of episodes."""
+        logger.info(f"Processing chunk {chunk_index} with {len(episodes)} episodes")
+        
+        # Create chunk directory
+        chunk_dir = self.output_dir / f"data/chunk-{chunk_index:03d}"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create HuggingFace features
+        hf_features = self._create_hf_features()
+        
+        # Process each episode in the chunk
+        for episode_index, csv_file in episodes:
+            # Read CSV file
+            df = pd.read_csv(csv_file)
+            
+            # Add required columns if they don't exist
+            if "frame_index" not in df.columns:
+                df["frame_index"] = range(len(df))
+            if "episode_index" not in df.columns:
+                df["episode_index"] = episode_index
+            if "index" not in df.columns:
+                df["index"] = range(len(df))
+            if "task_index" not in df.columns:
+                df["task_index"] = 0  # Default task index
+            
+            # Restructure DataFrame
+            restructured_df = self._restructure_dataframe(df)
+            
+            # Convert to HuggingFace dataset
+            try:
+                hf_dataset = datasets.Dataset.from_pandas(restructured_df, features=hf_features)
+                
+                # Save as parquet
+                output_file = chunk_dir / f"episode_{episode_index:06d}.parquet"
+                hf_dataset.to_parquet(output_file)
+                
+                logger.debug(f"Saved episode {episode_index} to {output_file}")
+            except Exception as e:
+                logger.error(f"Failed to process episode {episode_index}: {str(e)}")
+                raise
+
+    def _organize_images(self, csv_files: List[Tuple[int, Path]]) -> None:
+        """
+        Organize images into the standard LeRobotDataset directory structure.
+        
+        When use_videos is False, this method copies images from the source directory
+        to the target directory with the structure:
+        {dataset_root}/images/chunk-{chunk_index:03d}/{image_key_as_directory}/episode_{episode_index:06d}/frame_{frame_index:06d}.png
+        
+        Args:
+            csv_files: List of tuples containing episode index and path to CSV file
+        """
+        if self.use_videos:
+            logger.info("Using videos mode, skipping image organization")
+            return
+        
+        logger.info("Organizing images into standard directory structure...")
+        
+        # Create image directory structure
+        image_base_dir = self.output_dir / "images"
+        image_base_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Process each episode
+        for episode_index, csv_path in tqdm(csv_files, desc="Organizing images"):
+            # Calculate chunk index
+            chunk_index = episode_index // self.chunk_size
+            
+            # Create directory structure for this episode
+            # Fix: Use consistent naming format for episode directories
+            target_dir = image_base_dir / f"chunk-{chunk_index:03d}" / self.image_key / f"episode_{episode_index:06d}"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Read CSV to get frame count
+            df = pd.read_csv(csv_path)
+            frame_count = len(df)
+            
+            # Copy each image
+            for frame_index in range(frame_count):
+                # Format the source image filename using the pattern
+                source_filename = self.image_pattern.format(episode=episode_index, frame=frame_index) + self.image_extension
+                source_path = self.image_dir / source_filename
+                
+                # Format the target image filename
+                target_path = target_dir / f"frame_{frame_index:06d}{self.image_extension}"
+                
+                # Copy the image if it exists
+                if source_path.exists():
+                    try:
+                        shutil.copy2(source_path, target_path)
+                        if self.debug:
+                            logger.debug(f"Copied image from {source_path} to {target_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to copy image: {e}")
+                        # Create a blank image as a fallback
+                        blank_image = Image.new('RGB', (self.image_width, self.image_height), color='black')
+                        blank_image.save(target_path)
+                else:
+                    logger.warning(f"Image file not found: {source_path}")
+                    # Create a blank image as a fallback
+                    blank_image = Image.new('RGB', (self.image_width, self.image_height), color='black')
+                    blank_image.save(target_path)
+        
+        logger.info(f"Image organization complete. Images stored in {image_base_dir}")
 
     def convert(self) -> None:
         """
@@ -689,6 +789,9 @@ class CSVToLeRobotDatasetConverter:
             self.fps = 5  # Default FPS
             logger.info(f"Using default FPS: {self.fps}")
         
+        # Organize images if not using videos
+        self._organize_images(csv_files)
+        
         # Create chunks of episodes
         chunks = []
         current_chunk = []
@@ -706,67 +809,13 @@ class CSVToLeRobotDatasetConverter:
         
         # Process each chunk
         for chunk_index, chunk in enumerate(tqdm(chunks, desc="Processing chunks")):
-            # Create chunk directory
-            chunk_dir = self.output_dir / "data" / f"chunk-{chunk_index:03d}"
-            chunk_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Process each episode in the chunk
-            for episode_index, csv_path in chunk:
-                # Get the DataFrame for this episode
-                df = all_dfs[episode_index]
-                
-                # Restructure the DataFrame to match the expected schema
-                restructured_df = self._restructure_dataframe(df)
-                
-                # Create HuggingFace features
-                hf_features = self._create_hf_features()
-                
-                # Create HuggingFace dataset
-                hf_dataset = datasets.Dataset.from_pandas(restructured_df, features=hf_features)
-                
-                # Save to parquet
-                episode_path = chunk_dir / f"episode_{episode_index:06d}.parquet"
-                hf_dataset.to_parquet(episode_path)
-                
-                # Copy images if not using videos
-                if not self.use_videos:
-                    for frame_index in range(len(df)):
-                        # Format episode and frame indices as strings with leading zeros
-                        episode_str = f"{episode_index:06d}"
-                        frame_str = f"{frame_index:06d}"
-                        # Copy images if not using videos
-                if not self.use_videos:
-                    # Create image directory structure
-                    image_dir = self.output_dir / "images" / f"chunk-{chunk_index:03d}" / self.image_key
-                    image_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    for frame_index in range(len(df)):
-                        # Format episode and frame indices as strings with leading zeros
-                        episode_str = f"{episode_index}"
-                        frame_str = f"{frame_index}"
-                        
-                        # Construct image filename based on pattern
-                        image_filename = self.image_pattern.format(episode=episode_str, frame=frame_str) + self.image_extension
-                        
-                        # Source and destination paths
-                        src_path = self.image_dir / image_filename
-                        dst_path = image_dir / f"episode_{episode_index:06d}_frame_{frame_index:06d}{self.image_extension}"
-                        
-                        # Check if source image exists
-                        if src_path.exists():
-                            # Copy the image
-                            shutil.copy2(src_path, dst_path)
-                        else:
-                            logger.warning(f"Image not found: {src_path}")
-                else:
-                    # Create videos from images
-                    self._create_videos(episode_index, chunk_index, df)
+            self._process_chunk(chunk_index, chunk)
         
         # Calculate statistics
         self._calculate_statistics(all_dfs)
         
         # Create metadata files
-        self._create_metadata(episode_lengths)
+        self._create_metadata(csv_files, episode_lengths)
         
         logger.info(f"Dataset conversion complete. Output directory: {self.output_dir}")
     
@@ -846,38 +895,47 @@ class CSVToLeRobotDatasetConverter:
         Args:
             private: Whether to make the dataset private
         """
-        # Make sure repo_id has the correct format (username/repo-name)
-        if "/" not in self.repo_id:
-            logger.warning(f"Repository ID '{self.repo_id}' does not contain a slash. "
-                          f"Using '{self.repo_id}/moon_lander' instead.")
-            self.repo_id = f"{self.repo_id}/moon_lander"
+        # Create a .gitattributes file to ensure large files are tracked with Git LFS
+        gitattributes_path = self.output_dir / ".gitattributes"
+        with open(gitattributes_path, "w") as f:
+            f.write("*.png filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.jpg filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.jpeg filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.mp4 filter=lfs diff=lfs merge=lfs -text\n")
+            f.write("*.parquet filter=lfs diff=lfs merge=lfs -text\n")
+        
+        # Create a README.md file with dataset information
+        readme_path = self.output_dir / "README.md"
+        with open(readme_path, "w") as f:
+            f.write(f"# {self.repo_id.split('/')[-1]}\n\n")
+            f.write(f"Dataset created with CSVToLeRobotDatasetConverter for {self.robot_type} robot.\n\n")
+            f.write(f"- Task: {self.task_name}\n")
+            f.write(f"- FPS: {self.fps}\n")
+            f.write(f"- Image dimensions: {self.image_width}x{self.image_height}\n")
+        
+        # Use huggingface_hub directly to upload the dataset
+        logger.info(f"Pushing dataset to {self.repo_id}")
         
         try:
-            # Try to load the dataset (this might fail if it's a new repository)
-            dataset = self.load_dataset()
-            logger.info(f"Pushing dataset to {self.repo_id}")
-            dataset.push_to_hub(private=private)
-        except Exception as e:
-            # Repository doesn't exist yet or there was another error
-            logger.info(f"Creating new repository {self.repo_id}")
-            logger.debug(f"Original error: {str(e)}")
+            # First create the repo if it doesn't exist
+            huggingface_hub.create_repo(
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                private=private,
+                exist_ok=True
+            )
             
-            try:
-                # Create the repository
-                api = huggingface_hub.HfApi()
-                api.create_repo(repo_id=self.repo_id, repo_type="dataset", private=private)
-                
-                # Upload the dataset files
-                logger.info("Uploading dataset files...")
-                api.upload_folder(
-                    folder_path=str(self.output_dir),
-                    repo_id=self.repo_id,
-                    repo_type="dataset",
-                )
-                logger.info(f"Dataset pushed to {self.repo_id}")
-            except Exception as upload_error:
-                logger.error(f"Failed to push dataset to Hub: {str(upload_error)}")
-                raise
+            # Then upload all files
+            huggingface_hub.upload_folder(
+                folder_path=str(self.output_dir),
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                ignore_patterns=["*.pyc", "__pycache__", ".git*"],
+            )
+            logger.info(f"Successfully pushed dataset to {self.repo_id}")
+        except Exception as e:
+            logger.error(f"Failed to push dataset to hub: {e}")
+            raise
 
 
 def main():
@@ -896,14 +954,13 @@ def main():
     parser.add_argument("--image-pattern", type=str, default="img_traj_{episode}_step_{frame}", help="Pattern for image filenames")
     parser.add_argument("--image-extension", type=str, default=".png", help="File extension for images")
     parser.add_argument("--csv-pattern", type=str, default="trajectory_{episode}.csv", help="Pattern for CSV filenames")
-    parser.add_argument("--use-videos", action="store_true", help="Encode images as videos")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--push", action="store_true", help="Push dataset to HuggingFace Hub")
+    parser.add_argument("--push", action="store_false", help="Push dataset to HuggingFace Hub")
     parser.add_argument("--private", action="store_true", help="Make the repository private")
-    
+    parser.add_argument("--robot-type", type=str, default="inav", help="Type of robot")
     # Add image dimension arguments
-    parser.add_argument("--image-height", type=int, default=256, help="Height of images in pixels")
-    parser.add_argument("--image-width", type=int, default=256, help="Width of images in pixels")
+    parser.add_argument("--image-height", type=int, default=480, help="Height of images in pixels")
+    parser.add_argument("--image-width", type=int, default=640, help="Width of images in pixels")
     
     args = parser.parse_args()
     
@@ -924,10 +981,10 @@ def main():
         image_pattern=args.image_pattern,
         image_extension=args.image_extension,
         csv_pattern=args.csv_pattern,
-        use_videos=args.use_videos,
         debug=args.debug,
         image_height=args.image_height,
         image_width=args.image_width,
+        robot_type=args.robot_type,
     )
     
     # Convert dataset

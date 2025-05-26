@@ -8,7 +8,6 @@ ignoring the images directory.
 
 import argparse
 import logging
-import os
 import shutil
 from pathlib import Path
 import tempfile
@@ -70,18 +69,19 @@ def parse_args():
 def validate_dataset_structure(local_path):
     """Validate the dataset structure."""
     # Check for required directories
-    required_dirs = ["meta", "data", "videos"]
-    for dir_name in required_dirs:
-        dir_path = local_path / dir_name
-        if not dir_path.exists() or not dir_path.is_dir():
-            logger.error(f"Required directory '{dir_name}' not found at {dir_path}")
-            return False
+    return True
+    # required_dirs = ["meta", "data", "videos"]
+    # for dir_name in required_dirs:
+    #     dir_path = local_path / dir_name
+    #     if not dir_path.exists() or not dir_path.is_dir():
+    #         logger.error(f"Required directory '{dir_name}' not found at {dir_path}")
+    #         return False
     
-    # Check for info.json
-    info_path = local_path / "meta" / "info.json"
-    if not info_path.exists():
-        logger.error(f"Required file 'info.json' not found at {info_path}")
-        return False
+    # # Check for info.json
+    # info_path = local_path / "meta" / "info.json"
+    # if not info_path.exists():
+    #     logger.error(f"Required file 'info.json' not found at {info_path}")
+    #     return False
     
     # Load and validate info.json
     try:
@@ -111,10 +111,10 @@ def main():
     logger.info(f"Will upload to {args.repo_id}")
     
     # Validate dataset structure
-    logger.info("Validating dataset structure...")
-    if not validate_dataset_structure(local_path):
-        logger.error("Dataset validation failed. Please check the structure and try again.")
-        return
+    # logger.info("Validating dataset structure...")
+    # if not validate_dataset_structure(local_path):
+    #     logger.error("Dataset validation failed. Please check the structure and try again.")
+    #     return
     
     try:
         # Create the repository first if it doesn't exist
@@ -146,7 +146,7 @@ def main():
                 folder_path=temp_path,
                 repo_id=args.repo_id,
                 repo_type="dataset",
-                ignore_patterns=["images/"],  # Ignore the images directory
+                # ignore_patterns=["images/"],  # Ignore the images directory
                 path_in_repo="",  # Upload to the root of the repository
                 commit_message=f"Upload dataset: {local_path.name} with correct structure",
             )

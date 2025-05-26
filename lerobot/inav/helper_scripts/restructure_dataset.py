@@ -105,11 +105,11 @@ def main():
     """Main function to restructure all episode files"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Restructure moon lander dataset")
+    parser = argparse.ArgumentParser(description="Restructure metarl dataset")
     parser.add_argument(
         "--data_dir", 
         type=str, 
-        default="/home/demo/lerobot-beavr/lerobot/inav/datasets/moon_lander_lerobot/data",
+        default="/home/demo/lerobot-beavr/datasets/docking_lerobot/data",
         help="Path to the data directory containing chunk folders"
     )
     args = parser.parse_args()

@@ -16,9 +16,9 @@ import huggingface_hub
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class SimpleMoonLanderConverter:
+class SimpleMetaRLDatasetConverter:
     """
-    A simplified converter for Moon Lander dataset.
+    A simplified converter for dataset.
     """
     
     def __init__(
@@ -34,7 +34,7 @@ class SimpleMoonLanderConverter:
         self.output_dir = Path(output_dir)
         self.repo_id = repo_id
         self.fps = fps
-        
+
         # Create output directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "meta").mkdir(parents=True, exist_ok=True)
@@ -53,6 +53,8 @@ class SimpleMoonLanderConverter:
         self.csv_files = list(self.csv_dir.glob("*.csv"))
         logger.info(f"Found {len(self.csv_files)} CSV files")
     
+        self.total_episodes = len(self.csv_files)
+
     def convert(self):
         """
         Convert the dataset.
@@ -110,36 +112,45 @@ class SimpleMoonLanderConverter:
         """
         # Create info.json
         info = {
-            "dataset_type": "lerobot_dataset",
-            "version": "2.1",
+            "codebase_version": "v2.1",
+            "robot_type": "docking",
             "fps": self.fps,
-            "num_episodes": len(episode_lengths),
-            "num_frames": sum(episode_lengths.values()),
-            "image_keys": ["observation.images"],
-            "camera_keys": ["observation.images"],
-            "state_keys": ["position", "velocity", "attitude", "angular_velocity"],
-            "action_key": "action",
-            "task_key": "task",
+            "total_episodes": self.total_episodes,
+            "total_frames": sum(episode_lengths.values()),
+            "total_tasks": 1,
+            "total_videos": self.total_episodes,
+            "total_chunks": 1,
+            "chunks_size": 1000,
+            "splits": {
+                "train": "0:" + str(self.total_episodes)
+            },
+            "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+            "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
             "features": {
-                "position": {
-                    "dtype": "float32",
-                    "shape": [3],
-                    "names": ["x", "y", "z"]
+                "observation.image.cam": {
+                    "dtype": "video",
+                    "shape": [3, 480, 640],
+                    "names": ["channels", "height", "width"],
+                    "video_info": {
+                        "video.fps": self.fps,
+                        "video.height": 480,
+                        "video.width": 640,
+                        "video.channels": 3,
+                        "video.codec": "av1",
+                        "video.pix_fmt": "yuv420p",
+                        "video.is_depth_map": False,
+                        "has_audio": False
+                    }
                 },
-                "velocity": {
+                "observation.state": {
                     "dtype": "float32",
-                    "shape": [3],
-                    "names": ["v_x", "v_y", "v_z"]
-                },
-                "attitude": {
-                    "dtype": "float32",
-                    "shape": [4],
-                    "names": ["q0", "q1", "q2", "q3"]
-                },
-                "angular_velocity": {
-                    "dtype": "float32",
-                    "shape": [3],
-                    "names": ["w1", "w2", "w3"]
+                    "shape": [13],
+                    "names": [
+                        "x", "y", "z",
+                        "v_x", "v_y", "v_z",
+                        "q0", "q1", "q2", "q3",
+                        "w1", "w2", "w3"
+                    ]
                 },
                 "action": {
                     "dtype": "float32",
@@ -149,32 +160,27 @@ class SimpleMoonLanderConverter:
                 "timestamp": {
                     "dtype": "float32",
                     "shape": [1],
-                    "names": ["timestamp"]
+                    "names": None
                 },
                 "frame_index": {
                     "dtype": "int64",
                     "shape": [1],
-                    "names": ["frame_index"]
+                    "names": None
                 },
                 "episode_index": {
                     "dtype": "int64",
                     "shape": [1],
-                    "names": ["episode_index"]
+                    "names": None
                 },
                 "task_index": {
                     "dtype": "int64",
                     "shape": [1],
-                    "names": ["task_index"]
+                    "names": None
                 },
                 "index": {
                     "dtype": "int64",
                     "shape": [1],
-                    "names": ["index"]
-                },
-                "observation.images": {
-                    "dtype": "image",
-                    "shape": [3, 256, 256],
-                    "names": ["channels", "height", "width"]
+                    "names": None
                 }
             }
         }
@@ -189,7 +195,7 @@ class SimpleMoonLanderConverter:
                 "episode_index": episode_idx,
                 "length": length,
                 "chunk_index": 0,  # All episodes in one chunk
-                "task": "moon_landing"
+                "task": "docking"
             })
         
         with open(self.output_dir / "meta" / "episodes.json", "w") as f:
@@ -199,8 +205,8 @@ class SimpleMoonLanderConverter:
         tasks = [
             {
                 "task_index": 0,
-                "task": "moon_landing",
-                "description": "Moon landing simulation"
+                "task": "docking",
+                "description": "Docking simulation"
             }
         ]
         
@@ -209,7 +215,7 @@ class SimpleMoonLanderConverter:
         
         # Create image_keys.json
         with open(self.output_dir / "meta" / "image_keys.json", "w") as f:
-            json.dump(["observation.images"], f, indent=2)
+            json.dump(["observation.image.cam"], f, indent=2)
     
     def push_to_hub(self, private=False):
         """
@@ -239,7 +245,7 @@ def main():
     """Main entry point."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Convert Moon Lander data to LeRobotDataset format")
+    parser = argparse.ArgumentParser(description="Convert dataset to LeRobotDataset format")
     parser.add_argument("--csv-dir", type=str, required=True, help="Directory containing CSV files")
     parser.add_argument("--image-dir", type=str, required=True, help="Directory containing image files")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to save the dataset")
@@ -251,7 +257,7 @@ def main():
     args = parser.parse_args()
     
     # Create converter
-    converter = SimpleMoonLanderConverter(
+    converter = SimpleMetaRLDatasetConverter(
         csv_dir=args.csv_dir,
         image_dir=args.image_dir,
         output_dir=args.output_dir,

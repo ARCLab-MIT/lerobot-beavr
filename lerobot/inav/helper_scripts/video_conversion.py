@@ -13,9 +13,9 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Paths
-SOURCE_DIR = Path("/home/demo/lerobot-beavr/lerobot/inav/datasets/moon_lander_lerobot")
-IMAGES_DIR = SOURCE_DIR / "images"
-OUTPUT_DIR = SOURCE_DIR / "videos/chunk-000/observation.images"
+SOURCE_DIR = Path("/home/demo/lerobot-beavr/datasets/docker0")
+IMAGES_DIR = SOURCE_DIR / "images/chunk-000/observation.image.cam"
+OUTPUT_DIR = SOURCE_DIR / "videos/chunk-000/observation.image.cam"
 META_FILE = SOURCE_DIR / "meta/info.json"
 
 def load_metadata():
