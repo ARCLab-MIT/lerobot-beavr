@@ -1,14 +1,19 @@
 import json
-import shutil
 import logging
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import huggingface_hub
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
 from PIL import Image
-import datasets
 from tqdm import tqdm
-import huggingface_hub
+
+import datasets
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.utils import DEFAULT_CHUNK_SIZE
+
 
 def _ensure_minimum_ndim(obj):
     """Recursively ensure that every numeric value is at least a 1-D NumPy array."""
@@ -31,20 +36,6 @@ def _ensure_minimum_ndim(obj):
         return np.atleast_1d(obj)
     except Exception:
         return obj
-
-
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.utils import (
-    INFO_PATH, 
-    EPISODES_PATH, 
-    STATS_PATH, 
-    EPISODES_STATS_PATH,
-    TASKS_PATH,
-    DEFAULT_CHUNK_SIZE,
-    DEFAULT_PARQUET_PATH,
-    DEFAULT_VIDEO_PATH,
-    DEFAULT_IMAGE_PATH,
-)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
