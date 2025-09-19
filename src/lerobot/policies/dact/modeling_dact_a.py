@@ -37,7 +37,7 @@ from lerobot.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.policies.dact.configuration_dact_a import DACTConfigA
 from lerobot.policies.normalize import Normalize, Unnormalize
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.utils import populate_queues
+from lerobot.policies.utils import get_device_from_parameters, populate_queues
 
 
 class DACTPolicyA(PreTrainedPolicy):
@@ -74,6 +74,14 @@ class DACTPolicyA(PreTrainedPolicy):
         )
 
         self.model = DACT(config)
+
+        self.temporal_attn_pool_1d = TemporalAttentionPool1D(config)
+        if config.image_features:
+            self.temporal_attn_pool_2d = TemporalAttentionPool2D(
+                config,
+                backbone=self.model.backbone,
+                backbone_out_channels=self.model.backbone_out_channels,
+            )
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -200,26 +208,52 @@ class DACTPolicyA(PreTrainedPolicy):
         """(B, T) mask with ones for valid timesteps, zeros for duplicated/padded."""
         t = self.config.n_obs_steps
         k = min(self._obs_steps_seen, t)
-        mask = torch.zeros(b, t, dtype=torch.bool, device=self.device)
+        device = get_device_from_parameters(self)
+        mask = torch.zeros(b, t, dtype=torch.bool, device=device)
         mask[:, :k] = 1
         return mask
 
+    # def _temporal_pool(self, hist: dict[str, Tensor], t_mask: Tensor) -> dict[str, Tensor]:
+    #     """Pool the history of observations to a single vector.
+    #     This is a simple average pooling over the time axis.
+    #     Args:
+    #         hist: Dictionary of tensors with a time axis.
+    #     Returns:
+    #         Dictionary of tensors without a time axis.
+    #     """
+    #     pooled = {}
+    #     for k, x in hist.items():
+    #         if k in {OBS_STATE, OBS_ENV_STATE}:
+    #             assert x.ndim >= 3 and x.size(1) == self.config.n_obs_steps
+    #             pooled[k] = self._masked_mean(x, t_mask, dim=1, keepdim=False)
+    #         elif k in {OBS_IMAGES}:
+    #             assert x.ndim >= 5 and x.size(1) == self.config.n_obs_steps
+    #             pooled[k] = self._masked_mean(x, t_mask, dim=1, keepdim=False)
+    #         else:
+    #             pooled[k] = x
+    #     return pooled
+
     def _temporal_pool(self, hist: dict[str, Tensor], t_mask: Tensor) -> dict[str, Tensor]:
         """Pool the history of observations to a single vector.
-        This is a simple average pooling over the time axis.
+        This is a temporal attention pooling over the time axis. It uses a learnable query to attend to the history of observations.
         Args:
             hist: Dictionary of tensors with a time axis.
+            t_mask: Time mask to ignore padded values.
         Returns:
             Dictionary of tensors without a time axis.
         """
         pooled = {}
         for k, x in hist.items():
             if k in {OBS_STATE, OBS_ENV_STATE}:
-                assert x.ndim >= 3 and x.size(1) == self.config.n_obs_steps
-                pooled[k] = self._masked_mean(x, t_mask, dim=1, keepdim=False)
+                pooled[k] = self.temporal_attn_pool_1d(x, t_mask)
             elif k in {OBS_IMAGES}:
-                assert x.ndim >= 5 and x.size(1) == self.config.n_obs_steps
-                pooled[k] = self._masked_mean(x, t_mask, dim=1, keepdim=False)
+                # Loop through n_cams and pool each camera independently
+                pooled[k] = []
+                for i in range(x.shape[2]): # Reminder: x.shape = (B, T, n_cams, C, H, W)
+                    # Reminder: hist[OBS_STATE].shape = (B, T, D)
+                    current_robot_state = hist[OBS_STATE][:, -1] # Use the last robot state for each camera
+                    pooled[k].append(self.temporal_attn_pool_2d(x=x[:, :, i], context=current_robot_state, mask=t_mask))
+                pooled[k] = torch.stack(pooled[k], dim=1)  # (B, n_cams, C, H, W)
             else:
                 pooled[k] = x
         return pooled
@@ -233,6 +267,14 @@ class DACTPolicyA(PreTrainedPolicy):
         b = next(iter(hist.values())).shape[0]
         t_mask = self._time_mask(b)
         hist = self._temporal_pool(hist, t_mask)
+
+        # Convert images to list format
+        if self.config.image_features and OBS_IMAGES in hist:
+            hist = dict(hist)  # shallow copy
+            # hist[OBS_IMAGES] already contains the pooled images (B, n_cams, C, H, W)
+            # Convert to list format: (B, n_cams, C, H, W) -> list of (B, C, H, W)
+            hist[OBS_IMAGES] = [hist[OBS_IMAGES][:, i] for i in range(hist[OBS_IMAGES].shape[1])]
+
         actions = self.model(hist)[0]
         actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
         return actions
@@ -412,29 +454,126 @@ class ACTTemporalEnsembler:
 
 class TemporalAttentionPool1D(nn.Module):
     """
-    Pools a temporal sequence (B, T, D) -> (B, D) with a learnable query.
+    Pools a temporal sequence (B, T, D(feature dimension)) -> (B, D (model dimension)) with a learnable query.
     'mask': (B, T) with True=valid will be converted for the attention mask.
     """
     def __init__(self, config: DACTConfigA):
         super().__init__()
         self.query =  nn.Parameter(torch.randn(1, 1, config.dim_model)) # (1, 1, D)
         self.attn = nn.MultiheadAttention(num_heads=config.n_heads, embed_dim=config.dim_model, batch_first=True)
-        self.time_pos_embed = nn.Embedding(config.chunk_size, config.dim_model) # (T, D)
+        # Time positions correspond to observation history length, not chunked action length
+        self.time_pos_embed = nn.Embedding(config.n_obs_steps, config.dim_model) # (T, D)
+        # Support projecting either robot state or env state into model dim
+        self._robot_dim = (
+            config.robot_state_feature.shape[0] if config.robot_state_feature is not None else None
+        )
+        self._env_dim = (
+            config.env_state_feature.shape[0] if config.env_state_feature is not None else None
+        )
+        if self._robot_dim is not None:
+            self.robot_state_input_proj = nn.Linear(self._robot_dim, config.dim_model)
+            self.robot_state_output_proj = nn.Linear(config.dim_model, self._robot_dim)
+        else:
+            self.robot_state_input_proj = None
+            self.robot_state_output_proj = None
+        if self._env_dim is not None:
+            self.env_state_input_proj = nn.Linear(self._env_dim, config.dim_model)
+            self.env_state_output_proj = nn.Linear(config.dim_model, self._env_dim)
+        else:
+            self.env_state_input_proj = None
+            self.env_state_output_proj = None
 
     def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
-        # x: (B, T, D), mask: (B, T) True=valid
+        # x: (B, T, D_in), mask: (B, T) True=valid
+        # Project input to model dimension depending on feature type
+        d_in = x.size(-1)
+        if self._robot_dim is not None and d_in == self._robot_dim and self.robot_state_input_proj is not None:
+            x = self.robot_state_input_proj(x)
+        elif self._env_dim is not None and d_in == self._env_dim and self.env_state_input_proj is not None:
+            x = self.env_state_input_proj(x)
+        elif d_in == self.attn.embed_dim:
+            # Already in model dimension
+            pass
+        else:
+            raise ValueError(
+                f"TemporalAttentionPool1D received input with dim {d_in}, which does not match robot ({self._robot_dim}) "
+                f"or env ({self._env_dim}) dims, and is not equal to model dim ({self.attn.embed_dim})."
+            )
         b, t, d = x.shape
 
         # Fetch the first T positional vectors and broadcast across the batch
-        t_ids = torch.arange(t, device=x.device)
-        t_pos_embed = self.time_pos_embed(t_ids)[None, :, :].expand(b, t, d)
+        device = get_device_from_parameters(self)
+        t_ids = torch.arange(t, device=device)
+        t_pos_embed = self.time_pos_embed(t_ids).unsqueeze(0).expand(b, t, d)
 
         x = x + t_pos_embed
 
         kpm = None if mask is None else ~mask
+        # Note: Expanded to batch size
+        # The query encodes a trainable notion of "how should I pool a sequence into one vector?"
         q = self.query.expand(b, -1, -1)
         out, _ = self.attn(q, x, x, key_padding_mask=kpm)
-        return out
+        out = out.squeeze(1) # (B, D_model)
+
+        # Project back to original dimension
+        if self._robot_dim is not None and d_in == self._robot_dim and self.robot_state_output_proj is not None:
+            out = self.robot_state_output_proj(out)
+        elif self._env_dim is not None and d_in == self._env_dim and self.env_state_output_proj is not None:
+            out = self.env_state_output_proj(out)
+        # If already in model dimension, keep as is
+
+        return out # (B, D_original)
+
+class TemporalAttentionPool2D(nn.Module):
+    """
+    Pools a stack of feature maps (B, T, C, H, W) -> (B, C, H, W) with frame-level attention.
+    Weights are derived from global pooled descriptors (B, T, C).
+    """
+    def __init__(self, config: DACTConfigA, backbone: nn.Module, backbone_out_channels: int):
+        super().__init__()
+        # Use a MLP to create a query informed by the robot state
+        self.query = nn.Sequential(
+            nn.Linear(config.robot_state_feature.shape[0], config.dim_model),
+            nn.ReLU(),
+            nn.Linear(config.dim_model, config.robot_state_feature.shape[0]),
+        )
+        self.attn = nn.MultiheadAttention(num_heads=config.n_heads, embed_dim=config.dim_model, batch_first=True)
+        # Time positions correspond to observation history length
+        self.time_pos_embed = nn.Embedding(config.n_obs_steps, config.dim_model) # (T, D)
+        # Use the shared CNN backbone to extract per-frame features
+        self.backbone = backbone
+        self.backbone_out_channels = backbone_out_channels
+        # Project frame descriptors from backbone channels to model dimension for attention
+        self.frame_feat_proj = nn.Linear(self.backbone_out_channels, config.dim_model)
+
+    def forward(self, x: Tensor, context: Tensor, mask: Tensor | None = None) -> Tensor:
+        # x: (B, T, C, H, W), mask: (B, T) True=valid
+        b, t, c, h, w = x.shape
+
+        # 1) Extract per-frame CNN features using the shared backbone
+        x_bt = x.reshape(b * t, c, h, w)                       # (B*T, C, H, W)
+        feat = self.backbone(x_bt)["feature_map"]              # (B*T, C_b, H_b, W_b)
+        h_b, w_b = feat.shape[2], feat.shape[3]                # Extract spatial dimensions
+
+        # 2) Frame-level descriptors for attention weights
+        g = feat.mean(dim=(2, 3))                              # (B*T, C_b)
+        g = self.frame_feat_proj(g)                            # (B*T, D)
+        g = g.view(b, t, -1)                                   # (B, T, D)
+
+        # 3) Temporal attention to get per-frame weights
+        device = get_device_from_parameters(self)
+        t_ids = torch.arange(t, device=device)
+        g = g + self.time_pos_embed(t_ids).unsqueeze(0).expand(b, t, g.size(-1))
+        kpm = None if mask is None else ~mask
+        q = self.query(context).unsqueeze(1) # (B, 1, D)
+        _, attn = self.attn(q, g, g, key_padding_mask=kpm)
+        # attn: (B, 1, T) softmax over time t
+        w = attn.squeeze(1).view(b, t, 1, 1, 1) # (B, T, 1, 1, 1)
+
+        # 4) Pool in feature space
+        feat = feat.view(b, t, self.backbone_out_channels, h_b, w_b)
+        out = (feat * w).sum(dim=1) # (B, C_b, H_b, W_b)
+        return out # (B, C_b, H_b, W_b)
 
 class DACT(nn.Module):
     """Action Chunking Transformer: The underlying neural network for ACTPolicy.
@@ -513,6 +652,8 @@ class DACT(nn.Module):
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            # Expose backbone output channels for consumers
+            self.backbone_out_channels = backbone_model.fc.in_features
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -531,7 +672,7 @@ class DACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                self.backbone_out_channels, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -594,7 +735,7 @@ class DACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE]) # (B, D)
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -657,8 +798,8 @@ class DACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
+            for cam_features in batch[OBS_IMAGES]:
+                # Assume we already have the backbone features
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
