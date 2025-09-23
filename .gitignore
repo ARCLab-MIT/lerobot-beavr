@@ -173,6 +173,10 @@ outputs/
 
 # Dev folders
 .cache/*
+*.stl
+*.urdf
+*.xml
+*.part
 
 # Dataset
 converted_datasets/
