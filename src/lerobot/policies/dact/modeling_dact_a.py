@@ -250,9 +250,9 @@ class DACTPolicyA(PreTrainedPolicy):
                 # Loop through n_cams and pool each camera independently
                 pooled[k] = []
                 for i in range(x.shape[2]): # Reminder: x.shape = (B, T, n_cams, C, H, W)
-                    # Reminder: x[OBS_STATE].shape = (B, T, D)
-                    current_robot_state = x[OBS_STATE][:, -1] # Use the last robot state for each camera
-                    pooled[k].append(self.temporal_attn_pool_2d(x=x[:, :, i], context=current_robot_state, t_mask=t_mask))
+                    # Reminder: hist[OBS_STATE].shape = (B, T, D)
+                    current_robot_state = hist[OBS_STATE][:, -1] # Use the last robot state for each camera
+                    pooled[k].append(self.temporal_attn_pool_2d(x=x[:, :, i], context=current_robot_state, mask=t_mask))
                 pooled[k] = torch.stack(pooled[k], dim=1)  # (B, n_cams, C, H, W)
             else:
                 pooled[k] = x
@@ -535,7 +535,7 @@ class TemporalAttentionPool2D(nn.Module):
         self.query = nn.Sequential(
             nn.Linear(config.robot_state_feature.shape[0], config.dim_model),
             nn.ReLU(),
-            nn.Linear(config.dim_model, config.robot_state_feature.shape[0]),
+            nn.Linear(config.dim_model, config.dim_model),
         )
         self.attn = nn.MultiheadAttention(num_heads=config.n_heads, embed_dim=config.dim_model, batch_first=True)
         # Time positions correspond to observation history length
