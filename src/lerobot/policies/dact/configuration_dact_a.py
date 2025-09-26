@@ -137,6 +137,21 @@ class DACTConfigA(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # History encoder (Mamba-based) configuration
+    history_d_state: int = 128
+    history_d_conv: int = 4
+    history_expand: int = 2
+    history_headdim: int = 64
+    history_use_mem_eff_path: bool = True
+
+    # Mamba-2
+    d_state: int = 128,
+    d_conv: int = 4,
+    expand: int = 2,
+    headdim: int = 64,
+    chunk_size: int = 256,
+    use_mem_eff_path: bool = True,
+
     def __post_init__(self):
         super().__post_init__()
 
