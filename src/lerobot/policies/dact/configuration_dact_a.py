@@ -91,7 +91,7 @@ class DACTConfigA(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 2
+    n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 1
 

@@ -34,20 +34,20 @@ from huggingface_hub import HfApi
 import lerobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
-# We ported a number of existing datasets ourselves, use this to see the list:
-print("List of available datasets:")
-pprint(lerobot.available_datasets)
+# # We ported a number of existing datasets ourselves, use this to see the list:
+# print("List of available datasets:")
+# pprint(lerobot.available_datasets)
 
-# You can also browse through the datasets created/ported by the community on the hub using the hub api:
-hub_api = HfApi()
-repo_ids = [info.id for info in hub_api.list_datasets(task_categories="robotics", tags=["LeRobot"])]
-pprint(repo_ids)
+# # You can also browse through the datasets created/ported by the community on the hub using the hub api:
+# hub_api = HfApi()
+# repo_ids = [info.id for info in hub_api.list_datasets(task_categories="robotics", tags=["LeRobot"])]
+# pprint(repo_ids)
 
 # Or simply explore them in your web browser directly at:
 # https://huggingface.co/datasets?other=LeRobot
 
 # Let's take this one for this example
-repo_id = "lerobot/aloha_mobile_cabinet"
+repo_id = "arclabmit/spacecraft_issdocking_dataset"
 # We can have a look and fetch its metadata to know more about it:
 ds_meta = LeRobotDatasetMetadata(repo_id)
 
@@ -70,7 +70,7 @@ print(ds_meta)
 
 # You can then load the actual dataset from the hub.
 # Either load any subset of episodes:
-dataset = LeRobotDataset(repo_id, episodes=[0, 10, 11, 23])
+dataset = LeRobotDataset(repo_id, episodes=[0, 10, 11, 23], tolerance_s=10)
 
 # And see how many frames you have:
 print(f"Selected episodes: {dataset.episodes}")
@@ -78,7 +78,7 @@ print(f"Number of episodes selected: {dataset.num_episodes}")
 print(f"Number of frames selected: {dataset.num_frames}")
 
 # Or simply load the entire dataset:
-dataset = LeRobotDataset(repo_id)
+dataset = LeRobotDataset(repo_id, tolerance_s=10)
 print(f"Number of episodes selected: {dataset.num_episodes}")
 print(f"Number of frames selected: {dataset.num_frames}")
 
@@ -127,7 +127,7 @@ delta_timestamps = {
 # Note that in any case, these delta_timestamps values need to be multiples of (1/fps) so that added to any
 # timestamp, you still get a valid timestamp.
 
-dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps)
+dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps, tolerance_s=10)
 print(f"\n{dataset[0][camera_key].shape=}")  # (4, c, h, w)
 print(f"{dataset[0]['observation.state'].shape=}")  # (6, c)
 print(f"{dataset[0]['action'].shape=}\n")  # (64, c)

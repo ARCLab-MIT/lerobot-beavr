@@ -194,6 +194,7 @@ class Mamba2(nn.Module):
             y = rearrange(y, "b h p -> b (h p)")
             if not self.rmsnorm:
                 y = y * self.act(z)
+
         else:
             a_full = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
             dt_full = repeat(dt, "b h -> b h p", p=self.headdim)
@@ -215,6 +216,7 @@ class Mamba2(nn.Module):
         if d_mlp > 0:
             y = torch.cat([F.silu(z0) * x0, y], dim=-1)
         out = self.out_proj(y)
+
         return out.unsqueeze(1), conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
