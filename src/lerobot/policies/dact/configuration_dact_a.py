@@ -149,7 +149,6 @@ class DACTConfigA(PreTrainedConfig):
     d_conv: int = 4,
     expand: int = 2,
     headdim: int = 64,
-    chunk_size: int = 256,
     use_mem_eff_path: bool = True,
 
     def __post_init__(self):
