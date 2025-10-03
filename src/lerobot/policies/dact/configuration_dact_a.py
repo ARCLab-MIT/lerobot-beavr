@@ -150,6 +150,8 @@ class DACTConfigA(PreTrainedConfig):
     expand: int = 2,
     headdim: int = 64,
     use_mem_eff_path: bool = True,
+    shuffle: bool = False
+
 
     def __post_init__(self):
         super().__post_init__()

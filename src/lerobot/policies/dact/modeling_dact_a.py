@@ -138,7 +138,7 @@ class DACTPolicyA(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        self._history_cache = None
+        self.history_cache = None
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -171,17 +171,17 @@ class DACTPolicyA(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        # Compute/update history token h_t
-        x_t, img_tokens, img_pos_embeds = self.history_encoder.fuse_obs_to_history_vec(batch)
-        if self._history_cache is None:
-            self._history_cache = self.history_encoder.init_cache(x_t.shape[0])
-        h_t, self._history_cache = self.history_encoder.step(x_t, self._history_cache)
-        batch[HISTORY_TOKEN] = h_t
-
         # Convert images to list format for model consumption
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+
+        # Compute/update history token h_t
+        x_t, img_tokens, img_pos_embeds = self.history_encoder.fuse_obs_to_history_vec(batch)
+        if self.history_cache is None:
+            self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+        h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
+        batch[HISTORY_TOKEN] = h_t
 
         actions = self.model(batch, img_tokens, img_pos_embeds)[0]
         return actions
@@ -194,9 +194,9 @@ class DACTPolicyA(PreTrainedPolicy):
 
         # Compute/update history token h_t
         x_t, img_tokens, img_pos_embeds = self.history_encoder.fuse_obs_to_history_vec(batch)
-        if self._history_cache is None:
-            self._history_cache = self.history_encoder.init_cache(x_t.shape[0])
-        h_t, self._history_cache = self.history_encoder.step(x_t, self._history_cache)
+        if self.history_cache is None:
+            self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+        h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
         batch[HISTORY_TOKEN] = h_t
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch, img_tokens, img_pos_embeds)
@@ -522,7 +522,6 @@ class HistoryEncoder(nn.Module):
     def init_cache(self, batch_size: int) -> tuple[Tensor, Tensor]:
         return self.mamba.allocate_inference_cache(batch_size=batch_size, max_seqlen=1, dtype=None)
 
-    @torch.no_grad()
     def step(
         self,
         x_t: Tensor,
@@ -542,6 +541,9 @@ class HistoryEncoder(nn.Module):
         # ssm_state is a (B, nheads, headdim, d_state) tensor
         # These tensors are used to store the state of the Mamba2 block
         conv_state, ssm_state = cache
+        # Treat prior cache as constants
+        conv_state = conv_state.detach()
+        ssm_state = ssm_state.detach()
         y, new_conv, new_ssm = self.mamba.step(x_t.unsqueeze(1), conv_state, ssm_state)
         y = y.squeeze(1) # (B, D)
         if valid_mask is not None:
@@ -557,7 +559,7 @@ class HistoryEncoder(nn.Module):
                     keep.view(-1, 1, 1, 1), ssm_state, new_ssm
                 )
         # Return the updated conv_state and ssm_state
-        return y, (new_conv, new_ssm)
+        return y, (new_conv.detach(), new_ssm.detach())
 
     def forward(self, x_seq: Tensor) -> Tensor:
         """Process a full sequence.
@@ -632,6 +634,12 @@ class HistoryEncoder(nn.Module):
                 cam_vectors.append(cam_repr.squeeze(0))  # (B, D)
 
         # Cross-camera pooling with learned query (if multiple cameras)
+        if len(cam_vectors) == 0:
+            raise ValueError(
+                "No camera features found in batch. Ensure batch contains image observations "
+                "and that they are properly converted to the OBS_IMAGES format."
+            )
+
         cam_stack = torch.stack(cam_vectors, dim=0)  # (N_cam, B, D)
 
         if cam_stack.shape[0] > 1:

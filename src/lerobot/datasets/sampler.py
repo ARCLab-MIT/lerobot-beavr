@@ -18,6 +18,21 @@ from collections.abc import Iterator
 import torch
 
 
+class WithIndex(torch.utils.data.Dataset):
+    def __init__(self, base):
+        self.base = base
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        item = self.base[idx]
+        item["__idx__"] = idx
+        return item
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
 class EpisodeAwareSampler:
     def __init__(
         self,
