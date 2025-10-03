@@ -18,6 +18,12 @@ class DatasetConfig:
     robot_type: str = "custom"
     task_name: str = "custom_task"
 
+    # Parser selection and options
+    parser_type: str = "csv_image"  # one of: "csv_image", "image_pair"
+    input_subdir: str = "input_ag2"  # used by image_pair parser
+    action_subdir: str = "action_ag2"  # used by image_pair parser
+    action_threshold: int = 200  # used by image_pair parser
+
     # Input/Output paths
     input_dir: str | Path = ""
     output_dir: str | Path | None = None
@@ -33,7 +39,7 @@ class DatasetConfig:
     image_keys: list[str] = field(default_factory=lambda: ["observation.images.camera"])
 
     # Processing options
-    use_videos: bool = True
+    use_videos: bool = False
     image_writer_processes: int = 0
     image_writer_threads: int = 4
     tolerance_s: float = 1e-4
@@ -45,7 +51,7 @@ class DatasetConfig:
     max_test_episodes: int = 1
 
     # HuggingFace Hub options
-    push_to_hub: bool = False
+    push_to_hub: bool = True
     private_repo: bool = False
 
     def __post_init__(self):

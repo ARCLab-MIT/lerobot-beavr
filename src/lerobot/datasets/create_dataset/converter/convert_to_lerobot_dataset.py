@@ -3,10 +3,14 @@
 import logging
 from typing import Any
 
+import numpy as np
+from PIL import Image as PILImage
+
 from tqdm import tqdm
 
 from lerobot.datasets.create_dataset.config.dataset_config import DatasetConfig
 from lerobot.datasets.create_dataset.parsers.csv_image import CSVImageParser
+from lerobot.datasets.create_dataset.parsers.image_pair import ImagePairParser
 from lerobot.datasets.create_dataset.parsers.parse_data import DataParser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import _validate_feature_names, validate_frame
@@ -17,7 +21,13 @@ class DatasetConverter:
 
     def __init__(self, config: DatasetConfig, parser: DataParser | None = None):
         self.config = config
-        self.parser = parser or CSVImageParser(config)
+        if parser is not None:
+            self.parser = parser
+        else:
+            if getattr(config, "parser_type", "csv_image") == "image_pair":
+                self.parser = ImagePairParser(config)
+            else:
+                self.parser = CSVImageParser(config)
         self.logger = self._setup_logging()
         self.dataset = None
 
@@ -33,6 +43,16 @@ class DatasetConverter:
 
         # Create empty LeRobotDataset
         features = self.parser.get_features()
+
+        # Normalize image feature shapes to 3 channels (RGB)
+        for key, ft in features.items():
+            if ft.get("dtype") in {"image", "video"}:
+                h, w, c = ft["shape"]
+                if c != 3:
+                    self.logger.warning(
+                        f"Feature '{key}' has {c} channels; forcing to 3 (RGB) for writer compatibility."
+                    )
+                    ft["shape"] = (h, w, 3)
 
         _validate_feature_names(features)
 
@@ -82,15 +102,15 @@ class DatasetConverter:
 
         for frame_idx in range(num_frames):
             frame = self._create_frame(episode_data, frame_idx)
+            # Inject task into frame for validation and storage
+            frame["task"] = episode_data["tasks"][frame_idx]
 
-            # Validate frame if enabled
+            # Validate frame if enabled (timestamp is handled internally by the dataset)
             if self.config.validate_data:
                 validate_frame(frame, self.dataset.features)
 
-            # Add frame to dataset with task and timestamp
-            task = episode_data["tasks"][frame_idx]
-            timestamp = episode_data["timestamps"][frame_idx]
-            self.dataset.add_frame(frame, task, timestamp)
+            # Add frame to dataset (timestamp will be set automatically based on fps)
+            self.dataset.add_frame(frame)
 
         # Save the complete episode
         self.dataset.save_episode()
@@ -111,6 +131,12 @@ class DatasetConverter:
         # Add image data
         for img_key in self.config.image_keys:
             if episode_data["images"][img_key][frame_idx] is not None:
-                frame[img_key] = episode_data["images"][img_key][frame_idx]
+                img = episode_data["images"][img_key][frame_idx]
+                # Simpler: ensure RGB via PIL
+                if isinstance(img, np.ndarray):
+                    img = PILImage.fromarray(img)
+                if isinstance(img, PILImage.Image):
+                    img = img.convert("RGB")
+                frame[img_key] = img
 
         return frame

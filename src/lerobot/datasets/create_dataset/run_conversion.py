@@ -38,15 +38,17 @@ Examples:
     # Quick setup arguments
     parser.add_argument("--repo-id", type=str, help="Repository ID for the dataset")
     parser.add_argument("--input-dir", type=str, help="Input directory containing raw data")
+    parser.add_argument("--output-dir", type=str, help="Output directory for converted dataset")
     parser.add_argument("--fps", type=int, help="Frames per second")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--test-mode", action="store_true", help="Process only first few episodes")
+    parser.add_argument("--parser", type=str, choices=["csv_image", "image_pair"], help="Select parser type")
 
     args = parser.parse_args()
 
     # Create sample config if requested
     if args.create_sample_config:
-        create_sample_config(args.create_sample_config, DEFAULT_CONFIG)
+        create_sample_config(args.create_sample_config)
         print(f"Sample configuration created: {args.create_sample_config}")
         return 0
 
@@ -59,9 +61,11 @@ Examples:
             config = DatasetConfig(
                 repo_id=args.repo_id,
                 input_dir=args.input_dir,
+                output_dir=args.output_dir,
                 fps=args.fps,
                 debug=args.debug or False,
                 test_mode=args.test_mode or False,
+                parser_type=args.parser or DEFAULT_CONFIG.get("parser_type", "csv_image"),
             )
         else:
             # Use defaults from DEFAULT_CONFIG
@@ -77,9 +81,11 @@ Examples:
 
         # Override config with command line arguments
         if args.debug:
-            config.debug = False
+            config.debug = True
         if args.test_mode:
             config.test_mode = True
+        if args.parser:
+            config.parser_type = args.parser
 
         # Run conversion
         converter = DatasetConverter(config)
