@@ -385,9 +385,11 @@ class DACT(nn.Module):
             )  # (B, 1, D)
             if self.config.robot_state_feature:
                 robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE]) # (B, D)
+                # robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
-            hist_embed = self.vae_encoder_history_input_proj(batch[HISTORY_TOKEN]).unsqueeze(1)  # (B, 1, D)
+            hist_embed = self.vae_encoder_history_input_proj(batch[HISTORY_TOKEN])  # (B, D)
+            hist_embed = hist_embed.unsqueeze(1)  # (B, 1, D)
             if self.config.robot_state_feature:
                 vae_encoder_input = [cls_embed, robot_state_embed, hist_embed, action_embed]  # (B, S+3, D)
             else:
@@ -436,14 +438,21 @@ class DACT(nn.Module):
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]).squeeze(1))
+            robot_state_token = self.encoder_robot_state_input_proj(batch[OBS_STATE])
+            # Squeeze out any extra dimensions (e.g., (B, 1, D) -> (B, D))
+            robot_state_token = robot_state_token.squeeze(1)
+            encoder_in_tokens.append(robot_state_token)
         # Environment state token.
         if self.config.env_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_env_state_input_proj(batch[OBS_ENV_STATE])
-            )
+            env_state_token = self.encoder_env_state_input_proj(batch[OBS_ENV_STATE])
+            # Squeeze out any extra dimensions (e.g., (B, 1, D) -> (B, D))
+            env_state_token = env_state_token.squeeze(1)
+            encoder_in_tokens.append(env_state_token)
         # History token
-        encoder_in_tokens.append(self.encoder_history_input_proj(batch[HISTORY_TOKEN]))
+        hist_token = self.encoder_history_input_proj(batch[HISTORY_TOKEN])
+        # Squeeze out any extra dimensions (e.g., (B, 1, D) -> (B, D))
+        hist_token = hist_token.squeeze(1)
+        encoder_in_tokens.append(hist_token)
 
         if self.config.image_features:
             for tokens, pos_embed in zip(img_tokens, img_pos_embeds, strict=False):
@@ -578,9 +587,15 @@ class HistoryEncoder(nn.Module):
 
         if self.config.robot_state_feature and OBS_STATE in batch:
             state_vec = self.model.encoder_robot_state_input_proj(batch[OBS_STATE])
+            # Squeeze out any extra dimensions (e.g., (B, 1, D) -> (B, D))
+            if state_vec.ndim > 2:
+                state_vec = state_vec.squeeze(1)
 
         if self.config.env_state_feature and OBS_ENV_STATE in batch:
             env_vec = self.model.encoder_env_state_input_proj(batch[OBS_ENV_STATE])
+            # Squeeze out any extra dimensions (e.g., (B, 1, D) -> (B, D))
+            if env_vec.ndim > 2:
+                env_vec = env_vec.squeeze(1)
 
         # Per-camera pooling via attention with single-token query
         cam_vectors: list[Tensor] = []
@@ -602,10 +617,10 @@ class HistoryEncoder(nn.Module):
                         q_vec = q_vec + state_vec
                     if env_vec is not None:
                         q_vec = q_vec + env_vec
-                    q = q_vec.transpose(0, 1)  # (1, B, D)
+                    q = q_vec.unsqueeze(0)  # (B, D) -> (1, B, D)
 
                 else:
-                    q = self.history_query.transpose(0, 1).expand(1, img.shape[0], -1)
+                    q = self.history_query.view(1, 1, -1).expand(1, img.shape[0], -1)   # (1, B, D)
 
                 # Save raw tokens and positions for downstream DACT consumption
                 img_tokens.append(cam_features)
@@ -643,8 +658,7 @@ class HistoryEncoder(nn.Module):
             x_t = self.history_fuse_norm(cam_fused)
             return x_t, img_tokens, img_pos_embeds
 
-        kv_stack = torch.stack(kv_tokens, dim=0)  # (N_kv, B, D)
-        kv = kv_stack.squeeze(0).transpose(0, 1)  # (N_kv, B, D)
+        kv = torch.stack(kv_tokens, dim=0)  # (N_kv, B, D)
         q = cam_fused.unsqueeze(0)  # (1, B, D)
         # Cast activations to parameter (module) expected dtype via q
         kv = kv.to(dtype=q.dtype, device=kv.device)
