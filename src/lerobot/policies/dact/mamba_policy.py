@@ -188,7 +188,7 @@ class Mamba2(nn.Module):
             d_a = torch.exp(dt * A)
             x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             d_bx = torch.einsum("bh,bn,bhp->bhpn", dt, b_mat, x)
-            ssm_state.copy_(ssm_state * rearrange(d_a, "b h -> b h 1 1") + d_bx)
+            ssm_state = ssm_state * rearrange(d_a, "b h -> b h 1 1") + d_bx
             y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), c_mat)
             y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
             y = rearrange(y, "b h p -> b (h p)")
