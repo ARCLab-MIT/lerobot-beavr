@@ -153,6 +153,15 @@ class Mamba2(nn.Module):
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+
+        # Debug: Check for NaN/inf in inputs
+        if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+            print("WARNING: NaN/inf in hidden_states input to Mamba2 step")
+        if torch.isnan(conv_state).any() or torch.isinf(conv_state).any():
+            print("WARNING: NaN/inf in conv_state input to Mamba2 step")
+        if torch.isnan(ssm_state).any() or torch.isinf(ssm_state).any():
+            print("WARNING: NaN/inf in ssm_state input to Mamba2 step")
+
         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (batch, D_in)
         d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
         z0, x0, z, xBC, dt = torch.split(  # noqa: N806
@@ -185,10 +194,23 @@ class Mamba2(nn.Module):
         if selective_state_update is None:
             assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
             dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))
+
+            # Clip dt to prevent explosion
+            dt = torch.clamp(dt, min=1e-6, max=1e3)
+
             d_a = torch.exp(dt * A)
+
+            # Clip d_a to prevent explosion
+            d_a = torch.clamp(d_a, min=1e-6, max=1e3)
+
             x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             d_bx = torch.einsum("bh,bn,bhp->bhpn", dt, b_mat, x)
-            ssm_state = ssm_state * rearrange(d_a, "b h -> b h 1 1") + d_bx
+
+            # Update SSM state with clipping
+            new_ssm_state = ssm_state * rearrange(d_a, "b h -> b h 1 1") + d_bx
+            new_ssm_state = torch.clamp(new_ssm_state, min=-1e3, max=1e3)
+            ssm_state = new_ssm_state
+
             y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), c_mat)
             y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
             y = rearrange(y, "b h p -> b (h p)")

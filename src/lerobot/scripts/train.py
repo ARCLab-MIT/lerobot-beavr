@@ -249,7 +249,47 @@ def train(cfg: TrainPipelineConfig):
 
         # boundary detection (episode starts are boundaries of previous episode)
         idx = batch["__idx__"].item()
-        is_boundary = idx in starts
+        # Map global index back to first-pass frame space using modulo
+        dataset_size = len(dataset)
+        mapped_idx = idx % dataset_size
+
+        # Layer A: Check if mapped index is exactly an episode start
+        is_boundary = mapped_idx in starts
+
+        # Layer B: Also check if this is the very first frame of the dataset (index 0)
+        # This handles the case where we wrap around to the beginning
+        if not is_boundary and mapped_idx == 0:
+            is_boundary = True
+
+        # Layer C: Check if we're at a position that should be an episode boundary
+        # based on the episode structure (every N frames)
+        if not is_boundary and len(starts) > 0:
+            # Get the episode length from the first few episodes
+            starts_list = sorted(list(starts))
+            if len(starts_list) >= 2:
+                episode_length = starts_list[1] - starts_list[0]
+                # Check if current position aligns with episode structure
+                if mapped_idx % episode_length == 0:
+                    is_boundary = True
+
+        # Debug: Track boundary detection
+        if not hasattr(policy, '_boundary_debug'):
+            policy._boundary_debug = {'total_frames': 0, 'boundaries_detected': 0, 'last_idx': None, 'idx_values': [], 'starts_sample': []}
+
+        policy._boundary_debug['total_frames'] += 1
+        policy._boundary_debug['idx_values'].append(idx)
+        if policy._boundary_debug['last_idx'] is not None:
+            policy._boundary_debug['idx_diff'] = idx - policy._boundary_debug['last_idx']
+        policy._boundary_debug['last_idx'] = idx
+
+        if is_boundary:
+            policy._boundary_debug['boundaries_detected'] += 1
+
+        # Debug: Print boundary detection details occasionally
+        if policy._boundary_debug['total_frames'] % 1000 == 0:
+            starts_list = sorted(list(starts))[:10]  # First 10 episode starts
+            recent_indices = policy._boundary_debug['idx_values'][-10:]  # Last 10 frame indices
+            print(f"DEBUG: starts_sample={starts_list}, recent_indices={recent_indices}, current_idx={idx}, is_boundary={is_boundary}")
 
         # If we encounter the start of a *new* episode and this isn't the very first frame
         # we've processed, we finalize the previous episode: clip+step+zero+sched+log.
@@ -263,6 +303,12 @@ def train(cfg: TrainPipelineConfig):
             )
             # bookkeeping for this optimizer update (= one episode)
             step += 1
+
+            # Debug: Print step info when actual training step completes (not every frame)
+            boundary_debug = getattr(policy, '_boundary_debug', {})
+            boundary_info = f", boundaries={boundary_debug.get('boundaries_detected', 0)}/{boundary_debug.get('total_frames', 0)}"
+            print(f"Training Step {step}: loss={last_loss_val:.4f}, policy_frames={getattr(policy, '_step_count', 0)}, resets={getattr(policy, '_reset_count', 0)}{boundary_info}")
+
             train_tracker.grad_norm = grad_norm
             train_tracker.lr = optimizer.param_groups[0]["lr"]
             train_tracker.step()

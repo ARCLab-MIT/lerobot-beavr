@@ -145,11 +145,11 @@ class DACTConfigA(PreTrainedConfig):
     history_use_mem_eff_path: bool = True
 
     # Mamba-2
-    d_state: int = 128,
-    d_conv: int = 4,
-    expand: int = 2,
-    headdim: int = 64,
-    use_mem_eff_path: bool = True,
+    d_state: int = 128
+    d_conv: int = 4
+    expand: int = 2
+    headdim: int = 64
+    use_mem_eff_path: bool = True
     shuffle: bool = False
 
 

@@ -139,6 +139,10 @@ class DACTPolicyA(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.history_cache = None
+        # Debug: track reset calls
+        if not hasattr(self, '_reset_count'):
+            self._reset_count = 0
+        self._reset_count += 1
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -196,6 +200,38 @@ class DACTPolicyA(PreTrainedPolicy):
         x_t, img_tokens, img_pos_embeds = self.history_encoder.fuse_obs_to_history_vec(batch)
         if self.history_cache is None:
             self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+
+        # Debug: Check for NaN/inf in cache before step
+        if not hasattr(self, '_step_count'):
+            self._step_count = 0
+        self._step_count += 1
+
+        conv_state, ssm_state = self.history_cache
+        if torch.isnan(conv_state).any() or torch.isinf(conv_state).any():
+            print(f"WARNING: NaN/inf in conv_state at step {self._step_count}")
+            # Reset cache if corrupted
+            print(f"Resetting corrupted history cache at step {self._step_count}")
+            self.history_cache = None
+            if self.history_cache is None:
+                self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+            conv_state, ssm_state = self.history_cache
+
+        if torch.isnan(ssm_state).any() or torch.isinf(ssm_state).any():
+            print(f"WARNING: NaN/inf in ssm_state at step {self._step_count}")
+            # Reset cache if corrupted
+            print(f"Resetting corrupted history cache at step {self._step_count}")
+            self.history_cache = None
+            if self.history_cache is None:
+                self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+            conv_state, ssm_state = self.history_cache
+
+        # Periodic cache reset every 100 steps to prevent state drift
+        if self._step_count % 100 == 0:
+            print(f"Periodic cache reset at step {self._step_count}")
+            self.history_cache = None
+            if self.history_cache is None:
+                self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+
         h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
         batch[HISTORY_TOKEN] = h_t
 
