@@ -15,12 +15,11 @@
 # limitations under the License.
 import logging
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
 import torch
-from pyarrow import null
 from termcolor import colored
 from torch.amp import GradScaler
 from torch.optim import Optimizer
@@ -52,7 +51,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 from lerobot.utils.wandb_utils import WandBLogger
-from lerobot.constants import OBS_STATE
+
 
 def update_policy(
     train_metrics: MetricsTracker,

@@ -190,8 +190,8 @@ class DACTConfigA(PreTrainedConfig):
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
     @property
-    def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+    def observation_delta_indices(self) -> None:
+        return None
 
     @property
     def action_delta_indices(self) -> list:
