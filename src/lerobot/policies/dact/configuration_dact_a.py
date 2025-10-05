@@ -110,8 +110,8 @@ class DACTConfigA(PreTrainedConfig):
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
     pre_norm: bool = False
-    dim_model: int = 512
-    n_heads: int = 8
+    dim_model: int = 1024
+    n_heads: int = 16
     dim_feedforward: int = 3200
     feedforward_activation: str = "relu"
     n_encoder_layers: int = 4
@@ -138,19 +138,23 @@ class DACTConfigA(PreTrainedConfig):
     optimizer_lr_backbone: float = 1e-5
 
     # History encoder (Mamba-based) configuration
-    history_d_state: int = 128
+    history_d_state: int = 256
     history_d_conv: int = 4
     history_expand: int = 2
-    history_headdim: int = 64
+    history_headdim: int = 128
     history_use_mem_eff_path: bool = True
 
     # Mamba-2
-    d_state: int = 128
+    d_state: int = 256
     d_conv: int = 4
     expand: int = 2
-    headdim: int = 64
+    headdim: int = 128
     use_mem_eff_path: bool = True
     shuffle: bool = False
+    patch_size: int = 14
+    layer_index: int = -4
+    dinov2_dim: int = 1024
+    num_cameras: int = 1
 
 
     def __post_init__(self):

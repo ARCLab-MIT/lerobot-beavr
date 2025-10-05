@@ -52,7 +52,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 from lerobot.utils.wandb_utils import WandBLogger
-
+from lerobot.constants import OBS_STATE
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -124,8 +124,18 @@ def optimizer_step_only(
     grad_scaler: GradScaler,
     lr_scheduler,
     grad_clip_norm: float,
+    episode_length: int = 1,
 ) -> float:
     grad_scaler.unscale_(optimizer)
+
+    # Normalize gradients by episode length to ensure consistent step size
+    # regardless of episode length
+    if episode_length > 0:
+        for param_group in optimizer.param_groups:
+            for param in param_group['params']:
+                if param.grad is not None:
+                    param.grad.data.mul_(1.0 / episode_length)
+
     grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip_norm, error_if_nonfinite=False)
     grad_scaler.step(optimizer)
     grad_scaler.update()
@@ -226,8 +236,10 @@ def train(cfg: TrainPipelineConfig):
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
+        "episode_s": AverageMeter("ep_s", ":.3f"),
+        "frame_s": AverageMeter("frm_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
+        "episode_length": AverageMeter("ep_len", ":1.0f"),
     }
 
     train_tracker = MetricsTracker(
@@ -238,6 +250,8 @@ def train(cfg: TrainPipelineConfig):
     first_frame_seen = False
     last_loss_val = None
     last_output_dict = {}
+    current_episode_length = 0
+    episode_start_time = None
 
     logging.info("Start offline training on a fixed dataset")
     # Interpret cfg.steps as "number of optimizer updates" (i.e., episodes)
@@ -294,20 +308,28 @@ def train(cfg: TrainPipelineConfig):
         # If we encounter the start of a *new* episode and this isn't the very first frame
         # we've processed, we finalize the previous episode: clip+step+zero+sched+log.
         if is_boundary and first_frame_seen:
+            # Record episode completion time
+            episode_end_time = time.perf_counter()
+            episode_duration = episode_end_time - episode_start_time if episode_start_time else 0
+
             grad_norm = optimizer_step_only(
                 policy=policy,
                 optimizer=optimizer,
                 grad_scaler=grad_scaler,
                 lr_scheduler=lr_scheduler,
                 grad_clip_norm=cfg.optimizer.grad_clip_norm,
+                episode_length=current_episode_length,
             )
             # bookkeeping for this optimizer update (= one episode)
             step += 1
 
-            # Debug: Print step info when actual training step completes (not every frame)
-            boundary_debug = getattr(policy, '_boundary_debug', {})
-            boundary_info = f", boundaries={boundary_debug.get('boundaries_detected', 0)}/{boundary_debug.get('total_frames', 0)}"
-            print(f"Training Step {step}: loss={last_loss_val:.4f}, policy_frames={getattr(policy, '_step_count', 0)}, resets={getattr(policy, '_reset_count', 0)}{boundary_info}")
+            # Update episode-level metrics
+            train_tracker.episode_s = episode_duration
+            train_tracker.episode_length = current_episode_length
+            if current_episode_length > 0:
+                train_tracker.frame_s = episode_duration / current_episode_length
+                # Calculate throughput metrics
+                frames_per_sec = current_episode_length / episode_duration if episode_duration > 0 else 0
 
             train_tracker.grad_norm = grad_norm
             train_tracker.lr = optimizer.param_groups[0]["lr"]
@@ -374,13 +396,18 @@ def train(cfg: TrainPipelineConfig):
             if step >= cfg.steps:
                 break
 
-            # We just started a new episode → reset recurrent state/history
+            # We just started a new episode → reset recurrent state/history and timing
             policy.reset()
+            # Reset episode length counter and timing for new episode
+            current_episode_length = 0
+            episode_start_time = time.perf_counter()
 
         # First frame ever (seed episode): reset before accumulating
         if not first_frame_seen:
             policy.reset()
             first_frame_seen = True
+            # Initialize episode timing for the first episode
+            episode_start_time = time.perf_counter()
 
         # -------------------- move to device & accumulate this frame --------------------
         for k, v in list(batch.items()):
@@ -395,6 +422,9 @@ def train(cfg: TrainPipelineConfig):
         )
         last_loss_val = loss_val
         last_output_dict = output_dict
+
+        # Track episode length for gradient normalization
+        current_episode_length += 1
 
     if eval_env:
         eval_env.close()

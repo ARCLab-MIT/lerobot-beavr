@@ -4,7 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from einops import rearrange, repeat
+from .configuration_dact_a import DACTConfigA
+import torchvision.transforms.functional as TF
 
+# Handle optional imports for CUDA compatibility
 try:
     from causal_conv1d import causal_conv1d_update
 except ImportError:
@@ -154,14 +157,6 @@ class Mamba2(nn.Module):
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 
-        # Debug: Check for NaN/inf in inputs
-        if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
-            print("WARNING: NaN/inf in hidden_states input to Mamba2 step")
-        if torch.isnan(conv_state).any() or torch.isinf(conv_state).any():
-            print("WARNING: NaN/inf in conv_state input to Mamba2 step")
-        if torch.isnan(ssm_state).any() or torch.isinf(ssm_state).any():
-            print("WARNING: NaN/inf in ssm_state input to Mamba2 step")
-
         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (batch, D_in)
         d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
         z0, x0, z, xBC, dt = torch.split(  # noqa: N806
@@ -237,9 +232,9 @@ class Mamba2(nn.Module):
             pass
         if d_mlp > 0:
             y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-        out = self.out_proj(y)
+        out = self.out_proj(y) # (B, D)
 
-        return out.unsqueeze(1), conv_state, ssm_state
+        return out, conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device
@@ -254,3 +249,74 @@ class Mamba2(nn.Module):
         return conv_state, ssm_state
     def _get_states_from_cache(self, *args, **kwargs):
         raise NotImplementedError
+
+class CrossCameraAttention(nn.Module):
+    def __init__(self, config: DACTConfigA):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads)
+        self.norm = nn.LayerNorm(config.dim_model)
+
+    def forward(self, query, key, value):
+        attn_output, _ = self.multihead_attn(query, key, value)
+        return self.norm(query + attn_output)
+
+
+class CrossModalAttention(nn.Module):
+    def __init__(self, config: DACTConfigA):
+        super().__init__()
+        self.proj_lowdim = nn.Sequential(
+            nn.Linear(14, 128),
+            nn.GELU(),
+            nn.Linear(128, 512),
+            nn.Dropout(0.2),
+            nn.Linear(512, config.dim_model)
+        )
+        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads)
+        self.norm = nn.LayerNorm(config.dim_model)
+
+    def forward(self, query, key, value):
+        key = self.proj_lowdim(key)
+        value = self.proj_lowdim(value)
+        attn_output, _ = self.multihead_attn(query, key, value)
+        return self.norm(query + attn_output)
+
+class FrozenDinov2(nn.Module):
+    def __init__(self, config: DACTConfigA):
+        super().__init__()
+        self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        self.patch_size = config.patch_size
+        self.layer_index = config.layer_index
+
+        for param in self.dino.parameters():
+            param.requires_grad_(False)
+        self.feature_hook = self._register_hook()
+
+    def _register_hook(self):
+        def hook(module, input, output):
+            self.intermediate_output = output
+        handle = self.dino.blocks[self.layer_index].register_forward_hook(hook)
+        return handle
+
+    def adaptive_resize(self, img, min_patches=8):
+        _, _, H, W = img.shape
+        min_size = self.patch_size * min_patches
+        scale = max(min_size / min(H, W), 1.0)
+        new_H = max(round(H * scale), min_size)
+        new_W = max(round(W * scale), min_size)
+        new_H = ((new_H + self.patch_size - 1) // self.patch_size) * self.patch_size
+        new_W = ((new_W + self.patch_size - 1) // self.patch_size) * self.patch_size
+        return TF.resize(img, (new_H, new_W), antialias=True)
+
+    def forward(self, x):
+        x = self.adaptive_resize(x)
+        B, _, H, W = x.shape
+
+        _ = self.dino(x)
+
+        features = self.intermediate_output
+
+        H_patch = H // self.patch_size
+        W_patch = W // self.patch_size
+        features = features[:, 1:, :]
+        features = features.permute(0, 2, 1).view(B, -1, H_patch, W_patch)
+        return features  # [B, dim, H_patch, W_patch]
