@@ -546,9 +546,9 @@ def check_timestamps_sync(
     within_tolerance = np.abs(diffs - (1.0 / fps)) <= tolerance_s
 
     # Mask to ignore differences at the boundaries between episodes
-    mask = np.ones(len(diffs), dtype=bool)
-    ignored_diffs = episode_data_index["to"][:-1] - 1  # indices at the end of each episode
-    mask[ignored_diffs] = False
+    # Find where episode_index changes (these are episode boundaries)
+    episode_changes = np.diff(episode_indices) != 0
+    mask = ~episode_changes  # Mask out (set to False) where episodes change
     filtered_within_tolerance = within_tolerance[mask]
 
     # Check if all remaining diffs are within tolerance

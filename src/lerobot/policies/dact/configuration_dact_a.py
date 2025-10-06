@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
 @PreTrainedConfig.register_subclass("dact_a")
@@ -92,8 +93,9 @@ class DACTConfigA(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 100
-    n_action_steps: int = 1
+    chunk_size: int = 50
+    n_action_steps: int = 50
+    step_tick: int | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -110,8 +112,8 @@ class DACTConfigA(PreTrainedConfig):
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
     pre_norm: bool = False
-    dim_model: int = 1024
-    n_heads: int = 16
+    dim_model: int = 512
+    n_heads: int = 8
     dim_feedforward: int = 3200
     feedforward_activation: str = "relu"
     n_encoder_layers: int = 4
@@ -126,11 +128,12 @@ class DACTConfigA(PreTrainedConfig):
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
-    temporal_ensemble_coeff: float | None = 0.01
+    temporal_ensemble_coeff: float | None = None
 
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
+    drop_n_first_frames: int = 0
 
     # Training preset
     optimizer_lr: float = 1e-5
@@ -138,21 +141,22 @@ class DACTConfigA(PreTrainedConfig):
     optimizer_lr_backbone: float = 1e-5
 
     # History encoder (Mamba-based) configuration
-    history_d_state: int = 256
+    history_d_state: int = 128
     history_d_conv: int = 4
     history_expand: int = 2
-    history_headdim: int = 128
+    history_headdim: int = 64
     history_use_mem_eff_path: bool = True
 
     # Mamba-2
-    d_state: int = 256
+    d_state: int = 128
     d_conv: int = 4
     expand: int = 2
-    headdim: int = 128
+    headdim: int = 64
     use_mem_eff_path: bool = True
     shuffle: bool = False
     patch_size: int = 14
     layer_index: int = -4
+    # DINOv2 ViT-L/14 feature dimension (matches FrozenDinov2 output channels)
     dinov2_dim: int = 1024
     num_cameras: int = 1
 

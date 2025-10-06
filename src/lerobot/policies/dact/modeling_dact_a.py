@@ -206,9 +206,12 @@ class DACTPolicyA(PreTrainedPolicy):
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
+        # Compute L1 loss only over non-padded actions
+        # Mask shape: (B, chunk_size, 1) where True = valid (not padded)
+        action_mask = ~batch["action_is_pad"].unsqueeze(-1)
+        l1_per_element = F.l1_loss(batch[ACTION], actions_hat, reduction="none") * action_mask
+        # Normalize by number of valid elements, not total elements
+        l1_loss = l1_per_element.sum() / action_mask.sum().clamp(min=1)
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:
@@ -380,9 +383,9 @@ class DACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
-        print(f"observation.state size: {batch['observation.state'].shape}")
-        print(f"observation.images size: {batch['observation.images'][0].shape}")
-        print(f"action size: {batch['action'].shape}")
+        # print(f"observation.state size: {batch['observation.state'].shape}")
+        # print(f"observation.images size: {batch['observation.images'][0].shape}")
+        # print(f"action size: {batch['action'].shape}")
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
@@ -570,7 +573,7 @@ class HistoryEncoder(nn.Module):
         # Treat prior cache as constants
         conv_state = conv_state.detach()
         ssm_state = ssm_state.detach()
-        h_t, new_conv, new_ssm = self.mamba.step(x_t, conv_state, ssm_state)
+        h_t, new_conv, new_ssm = self.mamba.step(x_t.unsqueeze(1), conv_state, ssm_state)
         # if valid_mask is not None:
         #     # Preserve states for invalid items
         #     keep = ~valid_mask
@@ -618,7 +621,7 @@ class HistoryEncoder(nn.Module):
 
         # 2
         if self.config.robot_state_feature:
-            low_dim_features = batch[OBS_STATE]  # (B, D)
+            low_dim_features = batch[OBS_STATE].unsqueeze(1)  # (B, 1, D)
             cam_features_proj = self.encoder_history_input_proj(cam_features) # (B, D)
             fused_features = self.cross_modal_attn(
                 query=cam_features_proj.unsqueeze(1),

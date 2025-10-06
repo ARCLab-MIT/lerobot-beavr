@@ -131,6 +131,7 @@ class ACTConfig(PreTrainedConfig):
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
+    drop_n_first_frames: int = 0
 
     # Training preset
     optimizer_lr: float = 1e-5

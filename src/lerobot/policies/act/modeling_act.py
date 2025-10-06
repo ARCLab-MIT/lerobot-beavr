@@ -156,9 +156,19 @@ class ACTPolicy(PreTrainedPolicy):
         batch = self.normalize_targets(batch)
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
+        # Compute L1 loss only over non-padded actions
+        # Mask shape: (B, chunk_size, 1) where True = valid (not padded)
+        action_mask = ~batch["action_is_pad"].unsqueeze(-1)
+        l1_per_element = F.l1_loss(batch[ACTION], actions_hat, reduction="none") * action_mask
+        # Normalize by number of valid elements, not total elements
+        l1_loss = l1_per_element.sum() / action_mask.sum().clamp(min=1)
+        
+        # Debug: Check for fully padded batches
+        if self.training and action_mask.sum().item() == 0:
+            import logging
+            logging.warning(f"[FULLY PADDED BATCH] No valid actions in batch! "
+                          f"batch['action_is_pad'].all()={batch['action_is_pad'].all().item()}, "
+                          f"batch shape={batch[ACTION].shape}")
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:

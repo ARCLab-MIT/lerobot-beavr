@@ -27,7 +27,7 @@ from torch.optim import Optimizer
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler, WithIndex
+from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -51,7 +51,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 from lerobot.utils.wandb_utils import WandBLogger
-
+from lerobot.constants import OBS_STATE
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -164,7 +164,6 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating dataset")
     dataset = make_dataset(cfg)
-    dataset = WithIndex(dataset) # Wrap dataset to also return its index
     print(f"cfg: {cfg}")
 
     # Create environment used for evaluating checkpoints during training on simulation data.
@@ -215,9 +214,6 @@ def train(cfg: TrainPipelineConfig):
         sampler = None
         shuffle = False  # <<< force off to preserve order even without sampler
 
-    # Episode start indices for boundary detection
-    starts = {int(i.item()) for i in dataset.base.episode_data_index["from"]}
-
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -247,10 +243,12 @@ def train(cfg: TrainPipelineConfig):
 
     # State for episode-aware stepping
     first_frame_seen = False
-    last_loss_val = None
+    episode_loss_sum = 0.0
+    episode_frame_count = 0
     last_output_dict = {}
     current_episode_length = 0
     episode_start_time = None
+    prev_episode_index = 0  # Track previous episode_index for boundary detection
 
     logging.info("Start offline training on a fixed dataset")
     # Interpret cfg.steps as "number of optimizer updates" (i.e., episodes)
@@ -260,49 +258,15 @@ def train(cfg: TrainPipelineConfig):
         batch = next(dl_iter)
         train_tracker.dataloading_s = time.perf_counter() - t0
 
-        # boundary detection (episode starts are boundaries of previous episode)
-        idx = batch["__idx__"].item()
-        # Map global index back to first-pass frame space using modulo
-        dataset_size = len(dataset)
-        mapped_idx = idx % dataset_size
+        # Boundary detection using episode_index field
+        # This is much simpler and more reliable than index-based detection
+        current_episode_index = batch["episode_index"].item()
+        is_boundary = (current_episode_index != prev_episode_index)
+        
+        # Debug: Log wrap-around detection
+        if is_boundary and first_frame_seen and current_episode_index < prev_episode_index:
+            logging.info(f"[WRAP-AROUND DETECTED] prev_ep={prev_episode_index} -> current_ep={current_episode_index} at step={step}")
 
-        # Layer A: Check if mapped index is exactly an episode start
-        is_boundary = mapped_idx in starts
-
-        # Layer B: Also check if this is the very first frame of the dataset (index 0)
-        # This handles the case where we wrap around to the beginning
-        if not is_boundary and mapped_idx == 0:
-            is_boundary = True
-
-        # Layer C: Check if we're at a position that should be an episode boundary
-        # based on the episode structure (every N frames)
-        if not is_boundary and len(starts) > 0:
-            # Get the episode length from the first few episodes
-            starts_list = sorted(list(starts))
-            if len(starts_list) >= 2:
-                episode_length = starts_list[1] - starts_list[0]
-                # Check if current position aligns with episode structure
-                if mapped_idx % episode_length == 0:
-                    is_boundary = True
-
-        # Debug: Track boundary detection
-        if not hasattr(policy, '_boundary_debug'):
-            policy._boundary_debug = {'total_frames': 0, 'boundaries_detected': 0, 'last_idx': None, 'idx_values': [], 'starts_sample': []}
-
-        policy._boundary_debug['total_frames'] += 1
-        policy._boundary_debug['idx_values'].append(idx)
-        if policy._boundary_debug['last_idx'] is not None:
-            policy._boundary_debug['idx_diff'] = idx - policy._boundary_debug['last_idx']
-        policy._boundary_debug['last_idx'] = idx
-
-        if is_boundary:
-            policy._boundary_debug['boundaries_detected'] += 1
-
-        # Debug: Print boundary detection details occasionally
-        if policy._boundary_debug['total_frames'] % 1000 == 0:
-            starts_list = sorted(list(starts))[:10]  # First 10 episode starts
-            recent_indices = policy._boundary_debug['idx_values'][-10:]  # Last 10 frame indices
-            print(f"DEBUG: starts_sample={starts_list}, recent_indices={recent_indices}, current_idx={idx}, is_boundary={is_boundary}")
 
         # If we encounter the start of a *new* episode and this isn't the very first frame
         # we've processed, we finalize the previous episode: clip+step+zero+sched+log.
@@ -340,9 +304,16 @@ def train(cfg: TrainPipelineConfig):
             is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
             if is_log_step:
-                # loss displayed is the last per-frame loss seen in that episode
-                if last_loss_val is not None:
-                    train_tracker.loss = last_loss_val
+                # Log episode-averaged loss (normalized by number of frames)
+                if episode_frame_count > 0:
+                    episode_avg_loss = episode_loss_sum / episode_frame_count
+                    train_tracker.loss = episode_avg_loss
+                    # Debug: Check for suspicious loss values
+                    if episode_avg_loss < 0.001 or episode_avg_loss == 0.0:
+                        logging.warning(f"[SUSPICIOUS LOSS] step={step}, loss={episode_avg_loss:.6f}, "
+                                      f"episode_loss_sum={episode_loss_sum:.6f}, episode_frame_count={episode_frame_count}")
+                else:
+                    logging.warning(f"[NO FRAMES] step={step}, episode_frame_count=0, cannot compute loss")
                 logging.info(train_tracker)
                 if wandb_logger:
                     wandb_log = train_tracker.to_dict()
@@ -397,8 +368,10 @@ def train(cfg: TrainPipelineConfig):
 
             # We just started a new episode → reset recurrent state/history and timing
             policy.reset()
-            # Reset episode length counter and timing for new episode
+            # Reset episode length counter, loss tracking, and timing for new episode
             current_episode_length = 0
+            episode_loss_sum = 0.0
+            episode_frame_count = 0
             episode_start_time = time.perf_counter()
 
         # First frame ever (seed episode): reset before accumulating
@@ -419,11 +392,24 @@ def train(cfg: TrainPipelineConfig):
             grad_scaler=grad_scaler,
             use_amp=cfg.policy.use_amp,
         )
-        last_loss_val = loss_val
+        # Accumulate loss for episode averaging
+        episode_loss_sum += loss_val
+        episode_frame_count += 1
         last_output_dict = output_dict
+        
+        # Debug: Log frames with suspicious loss
+        if loss_val < 0.001 or loss_val == 0.0:
+            num_valid_actions = (~batch["action_is_pad"]).sum().item()
+            logging.warning(f"[FRAME WITH ZERO LOSS] step={step}, ep_idx={current_episode_index}, "
+                          f"loss={loss_val:.6f}, valid_actions={num_valid_actions}, "
+                          f"frame_count={episode_frame_count}")
 
         # Track episode length for gradient normalization
         current_episode_length += 1
+        
+        # Update prev_episode_index after processing this frame
+        # (Critical: must be after processing so boundary detection works correctly next iteration)
+        prev_episode_index = current_episode_index
 
     if eval_env:
         eval_env.close()
