@@ -10,6 +10,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
 import logging
+import random
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -60,30 +61,38 @@ class LockstepEpisodeIterator:
     pulling the next episode index from the queue.
     """
 
-    def __init__(self, episode_data_index: dict[str, torch.Tensor], B: int):
+    def __init__(self, episode_data_index: dict[str, torch.Tensor], b: int):
         self.from_list = episode_data_index["from"].tolist()
         self.to_list = episode_data_index["to"].tolist()
         self.num_episodes = len(self.from_list)
-        self.B = B
+        self.B = b
 
         # Queue of remaining episode ids
         self.remaining = deque(range(self.num_episodes))
 
         # Per-stream episode id and pointers
-        self.stream_ep = [-1] * B
-        self.ptr_from = [0] * B
-        self.ptr_to = [0] * B
-        self.ptr_cur = [0] * B
+        self.stream_ep = [-1] * b
+        self.ptr_from = [0] * b
+        self.ptr_to = [0] * b
+        self.ptr_cur = [0] * b
+        # Per-stream random offset within episode (for decorrelating initial steps)
+        self.stream_offset = [0] * b
 
         # Initialize streams
-        for i in range(B):
+        for i in range(b):
             if not self.remaining:
                 break
             ep = self.remaining.popleft()
             self.stream_ep[i] = ep
             self.ptr_from[i] = self.from_list[ep]
             self.ptr_to[i] = self.to_list[ep]
-            self.ptr_cur[i] = self.ptr_from[i]
+            # Choose random offset within episode bounds
+            episode_length = self.ptr_to[i] - self.ptr_from[i]
+            if episode_length > 1:
+                self.stream_offset[i] = random.randint(0, episode_length - 1)
+            else:
+                self.stream_offset[i] = 0
+            self.ptr_cur[i] = self.ptr_from[i] + self.stream_offset[i]
 
     def _reload_stream(self, i: int) -> bool:
         # If exhausted, wrap-around by refilling the queue
@@ -93,7 +102,13 @@ class LockstepEpisodeIterator:
         self.stream_ep[i] = ep
         self.ptr_from[i] = self.from_list[ep]
         self.ptr_to[i] = self.to_list[ep]
-        self.ptr_cur[i] = self.ptr_from[i]
+        # Choose random offset within episode bounds for new episode
+        episode_length = self.ptr_to[i] - self.ptr_from[i]
+        if episode_length > 1:
+            self.stream_offset[i] = random.randint(0, episode_length - 1)
+        else:
+            self.stream_offset[i] = 0
+        self.ptr_cur[i] = self.ptr_from[i] + self.stream_offset[i]
         return True
 
     def __iter__(self):
@@ -105,8 +120,8 @@ class LockstepEpisodeIterator:
 
         # Determine next frames; always keep B active via wrap-around
         for i in range(self.B):
-            # If at episode boundary (i.e., just reloaded), signal reset for this stream
-            if self.ptr_cur[i] == self.ptr_from[i]:
+            # If at stream's starting position (i.e., just started or just reloaded), signal reset for this stream
+            if self.ptr_cur[i] == self.ptr_from[i] + self.stream_offset[i]:
                 reset_mask[i] = True
             frame_indices.append(self.ptr_cur[i])
 
@@ -147,10 +162,21 @@ def _gather_batch(dataset, frame_indices: list[int]) -> dict:
             batch[k] = v_list
     return batch
 
+def _gather_random_batch(dataset, batch_size: int) -> dict:
+    # Sample IID frames uniformly from the full dataset range
+    frame_indices = [random.randrange(dataset.num_frames) for _ in range(batch_size)]
+    return _gather_batch(dataset, frame_indices)
+
+def _toggle_requires_grad(module: torch.nn.Module, enable: bool) -> None:
+    for p in module.parameters(recurse=True):
+        if p.requires_grad != enable:
+            p.requires_grad = enable
+
 def _splice_rows(cache, fresh, mask):
-    if cache is None or fresh is None: return cache
+    if cache is None or fresh is None:
+        return cache
     if isinstance(cache, (tuple, list)):
-        return type(cache)(_splice_rows(c,f,mask) for c,f in zip(cache, fresh))
+        return type(cache)(_splice_rows(c,f,mask) for c,f in zip(cache, fresh, strict=False))
     if torch.is_tensor(cache):
         m = mask.view(cache.shape[0], *([1] * (cache.dim()-1)))
         return torch.where(m, fresh.to(cache.device, cache.dtype), cache)
@@ -159,13 +185,60 @@ def _splice_rows(cache, fresh, mask):
 
 def _masked_history_reset(policy, reset_mask, fresh_template=None):
     if not hasattr(policy, "history_encoder"):
-        if reset_mask.any(): policy.reset()
+        if reset_mask.any():
+            policy.reset()
         return
-    if getattr(policy, "history_cache", None) is None or not reset_mask.any():
+    if (
+        getattr(policy, "history_cache", None) is None
+        or not reset_mask.any()
+    ):
         return
     if fresh_template is None:
         fresh_template = policy.history_encoder.init_cache(reset_mask.shape[0])
     policy.history_cache = _splice_rows(policy.history_cache, fresh_template, reset_mask)
+
+
+def _check_history_encoder_grad_norm(policy, use_iid: bool, step: int, log_freq: int = 100) -> None:
+    """Check gradient norms for history encoder to verify freezing is working.
+
+    Args:
+        policy: The policy model
+        use_iid: Whether this is an IID training step
+        step: Current training step
+        log_freq: How often to log the gradient norm check
+    """
+    if not hasattr(policy, "history_encoder") or policy.history_encoder is None:
+        return
+
+    # Calculate gradient norm for history encoder parameters
+    history_grad_norm = 0.0
+    history_param_count = 0
+    for param in policy.history_encoder.parameters():
+        if param.grad is not None:
+            history_grad_norm += param.grad.data.norm(2).item() ** 2
+            history_param_count += 1
+
+    if history_param_count > 0:
+        history_grad_norm = history_grad_norm ** 0.5
+
+        # Log gradient norm check periodically
+        if step % log_freq == 0:
+            expected_behavior = "ZERO" if use_iid else "NON-ZERO"
+            actual_behavior = "ZERO" if history_grad_norm < 1e-8 else "NON-ZERO"
+            status = "✓" if (use_iid and history_grad_norm < 1e-8) or (not use_iid and history_grad_norm >= 1e-8) else "✗"
+
+            logging.info(
+                f"History encoder grad norm check [step {step}]: "
+                f"norm={history_grad_norm:.2e}, expected={expected_behavior}, "
+                f"actual={actual_behavior} {status}"
+            )
+
+            # Warning if freezing isn't working as expected
+            if use_iid and history_grad_norm >= 1e-8:
+                logging.warning(
+                    f"WARNING: History encoder should be frozen during IID training but has "
+                    f"gradient norm {history_grad_norm:.2e}"
+                )
 
 
 
@@ -222,6 +295,7 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating dataset")
     dataset = make_dataset(cfg)
+    print(f"dataset: {dataset}")
 
     # Optional eval env
     eval_env = None
@@ -252,12 +326,11 @@ def train(cfg: TrainPipelineConfig):
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # Sequential config (defaults)
-    seq_cfg = SequentialConfig()
-    B = cfg.batch_size
-    step_tick = cfg.policy.step_tick if cfg.policy.step_tick is not None else B
+    # Sequential training batch size
+    batch_size = cfg.batch_size
+    step_tick = cfg.policy.step_tick if cfg.policy.step_tick is not None else batch_size
 
-    iterator = LockstepEpisodeIterator(dataset.episode_data_index, B=B)
+    iterator = LockstepEpisodeIterator(dataset.episode_data_index, B=batch_size)
 
     policy.train()
     meters = {
@@ -270,7 +343,7 @@ def train(cfg: TrainPipelineConfig):
         "frame_s": AverageMeter("frm_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
-    tracker = MetricsTracker(B, dataset.num_frames, dataset.num_episodes, meters, initial_step=step)
+    tracker = MetricsTracker(batch_size, dataset.num_frames, dataset.num_episodes, meters, initial_step=step)
 
     frames_since_step = 0
     episode_start_time = time.perf_counter()
@@ -278,13 +351,14 @@ def train(cfg: TrainPipelineConfig):
     logging.info("Start offline sequential training with lockstep episodes")
 
     if hasattr(policy, "history_encoder"):
-        policy.history_cache = policy.history_encoder.init_cache(B)
+        policy.history_cache = policy.history_encoder.init_cache(batch_size)
         # device/dtype safety
         def _to(x):
-            if isinstance(x, (tuple, list)): return type(x)(_to(t) for t in x)
+            if isinstance(x, (tuple, list)):
+                return type(x)(_to(t) for t in x)
             return x.to(device) if torch.is_tensor(x) else x
         policy.history_cache = _to(policy.history_cache)
-        _fresh_cache_template = policy.history_encoder.init_cache(B)
+        _fresh_cache_template = policy.history_encoder.init_cache(batch_size)
     else:
         _fresh_cache_template = None
 
@@ -296,24 +370,43 @@ def train(cfg: TrainPipelineConfig):
             break
         tracker.dataloading_s = time.perf_counter() - t0
 
-        batch = _gather_batch(dataset, frame_indices)
+        # Hybrid batching: 80% sequential, 20% IID
+        use_iid = random.random() < 0.2
+        if use_iid:
+            batch = _gather_random_batch(dataset, batch_size)
+        else:
+            batch = _gather_batch(dataset, frame_indices)
 
         # Move tensors to device
         for k, v in list(batch.items()):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device, non_blocking=device.type == "cuda")
 
-        # Masked per-stream history reset
-        _masked_history_reset(policy, reset_mask.to(device), _fresh_cache_template)
+        # Masked per-stream history reset (only for sequential microsteps)
+        if not use_iid:
+            _masked_history_reset(policy, reset_mask.to(device), _fresh_cache_template)
+
+        # For IID microsteps, freeze history encoder parameters (if present)
+        history_frozen = False
+        if use_iid and hasattr(policy, "history_encoder") and policy.history_encoder is not None:
+            _toggle_requires_grad(policy.history_encoder, False)
+            history_frozen = True
 
         # Accumulate gradients per frame
-        loss_val, loss_dict = _accumulate_step(policy, batch, grad_scaler, cfg.policy.use_amp, B)
+        loss_val, loss_dict = _accumulate_step(policy, batch, grad_scaler, cfg.policy.use_amp, batch_size)
+
+        # Check history encoder gradient norms to verify freezing
+        _check_history_encoder_grad_norm(policy, use_iid, step, log_freq=cfg.log_freq if cfg.log_freq > 0 else 100)
+
+        # Restore history encoder requires_grad after IID step
+        if history_frozen:
+            _toggle_requires_grad(policy.history_encoder, True)
         meters["loss"].update(loss_val)
         if "l1_loss" in loss_dict:
             meters["l1_loss"].update(loss_dict["l1_loss"])
         if "kld_loss" in loss_dict:
             meters["kld_loss"].update(loss_dict["kld_loss"])
-        frames_since_step += B
+        frames_since_step += batch_size
 
         # Optimizer step when we hit step_tick frames
         if frames_since_step >= step_tick:
@@ -374,7 +467,7 @@ def train(cfg: TrainPipelineConfig):
                     "pc_success": AverageMeter("success", ":.1f"),
                     "eval_s": AverageMeter("eval_s", ":.3f"),
                 }
-                eval_tracker = MetricsTracker(B, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step)
+                eval_tracker = MetricsTracker(batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step)
                 eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
                 eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
                 eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
