@@ -27,9 +27,9 @@ from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
 
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.constants import ACTION, OBS_STATE
 from lerobot.optim.optimizers import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 
@@ -71,9 +71,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     tags: list[str] | None = None
     # Add tags to your policy on the hub.
     license: str | None = None
+    # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
+    # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
+    pretrained_path: str | None = None
 
     def __post_init__(self):
-        self.pretrained_path = None
         if not self.device or not is_torch_device_available(self.device):
             auto_device = auto_select_torch_device()
             logging.warning(f"Device '{self.device}' is not available. Switching to '{auto_device}'.")
