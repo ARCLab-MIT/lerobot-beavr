@@ -9,7 +9,7 @@ DEFAULT_CONFIG = {
     "output_dir": "/mnt/data/aposadasn/datafromEnrico/diff_train/lerobot_dataset",
     # csv_image parser patterns (unused when parser_type == image_pair)
     "csv_pattern": "trajectory_{episode}.csv",
-    "image_pattern": "img_episode_{episode}_frame_{frame}",
+    "image_pattern": "ep_{episode}_agent_{agent}_img_{img}.png",
     "image_extension": ".png",
     "action_columns": [],
     "state_columns": [],

@@ -30,7 +30,7 @@ class DatasetConfig:
 
     # Data format configuration
     csv_pattern: str = "trajectory_{episode}.csv"
-    image_pattern: str = "img_episode_{episode}_frame_{frame}.png"
+    image_pattern: str = "ep_{episode}_agent_{agent}_img_{img}.png"
     image_extension: str = ".png"
 
     # Features configuration
