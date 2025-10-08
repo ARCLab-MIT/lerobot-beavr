@@ -94,7 +94,7 @@ class DACTConfigA(PreTrainedConfig):
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 50
-    n_action_steps: int = 1
+    n_action_steps: int = 50
     step_tick: int | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -128,17 +128,20 @@ class DACTConfigA(PreTrainedConfig):
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
-    temporal_ensemble_coeff: float | None = 0.01
+    temporal_ensemble_coeff: float | None = None
 
     # Training and loss computation.
     dropout: float = 0.1
-    kl_weight: float = 10.0
+    kl_weight: float = 1.0
     drop_n_first_frames: int = 0
 
     # Training preset
-    optimizer_lr: float = 1e-5
+    optimizer_lr: float = 3e-4
+    scheduler_decay_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
+    num_warmup_steps: int = 1000
+    num_decay_steps: int = 5000
 
     # History encoder (Mamba-based) configuration
     history_d_state: int = 128
@@ -186,8 +189,16 @@ class DACTConfigA(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self) -> None:
-        return None
+    # def get_scheduler_preset(self) -> None:
+    #     return None
+
+    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig: 
+        return CosineDecayWithWarmupSchedulerConfig(
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.scheduler_decay_lr,
+            num_warmup_steps=self.num_warmup_steps,
+            num_decay_steps=self.num_decay_steps,
+        )
 
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:

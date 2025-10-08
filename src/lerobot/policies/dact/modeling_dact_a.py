@@ -99,12 +99,9 @@ class DACTPolicyA(PreTrainedPolicy):
         self.history_encoder = HistoryEncoder(
             config=config,
         )
-        # Wire shared modules so HistoryEncoder can reuse them
-        if self.config.image_features:
-            self.history_encoder.backbone = self.backbone
-            self.history_encoder.model = self.model
-            self.history_encoder.encoder_cam_feat_pos_embed = self.model.encoder_cam_feat_pos_embed
-            self.history_encoder.encoder_img_feat_input_proj = self.model.encoder_img_feat_input_proj
+        self.history_encoder.hist_backbone.eval()
+        for param in self.history_encoder.hist_backbone.parameters():
+            param.requires_grad = False
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -182,8 +179,24 @@ class DACTPolicyA(PreTrainedPolicy):
 
         # Compute/update history token h_t
         x_t = self.history_encoder.fuse_obs_to_history_vec(batch)
+
+        # Check if cache batch size matches current batch size, reinitialize if needed
+        current_batch_size = x_t.shape[0]
         if self.history_cache is None:
-            self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+            self.history_cache = self.history_encoder.init_cache(current_batch_size)
+        else:
+            # Check if cache batch size matches current batch size
+            cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
+            if cache_batch_size != current_batch_size:
+                self.history_cache = self.history_encoder.init_cache(current_batch_size)
+
+        # Ensure cache is on the same device as input
+        if hasattr(self.history_cache[0], 'device'):
+            target_device = x_t.device
+            if self.history_cache[0].device != target_device:
+                self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
+                                          for cache in self.history_cache)
+
         h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
         batch[HISTORY_TOKEN] = h_t
 
@@ -198,10 +211,26 @@ class DACTPolicyA(PreTrainedPolicy):
 
         # Compute/update history token h_t
         x_t = self.history_encoder.fuse_obs_to_history_vec(batch)
+
+        # Check if cache batch size matches current batch size, reinitialize if needed
+        current_batch_size = x_t.shape[0]
         if self.history_cache is None:
-            self.history_cache = self.history_encoder.init_cache(x_t.shape[0])
+            self.history_cache = self.history_encoder.init_cache(current_batch_size)
+        else:
+            # Check if cache batch size matches current batch size
+            cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
+            if cache_batch_size != current_batch_size:
+                self.history_cache = self.history_encoder.init_cache(current_batch_size)
+
+        # Ensure cache is on the same device as input
+        if hasattr(self.history_cache[0], 'device'):
+            target_device = x_t.device
+            if self.history_cache[0].device != target_device:
+                self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
+                                          for cache in self.history_cache)
 
         h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
+
         batch[HISTORY_TOKEN] = h_t
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
@@ -573,6 +602,10 @@ class HistoryEncoder(nn.Module):
         # Treat prior cache as constants
         conv_state = conv_state.detach()
         ssm_state = ssm_state.detach()
+        # When history encoder is frozen, detach x_t to prevent gradient flow from vision backbone
+        if not any(p.requires_grad for p in self.parameters()):
+            x_t = x_t.detach()
+
         h_t, new_conv, new_ssm = self.mamba.step(x_t.unsqueeze(1), conv_state, ssm_state)
         # if valid_mask is not None:
         #     # Preserve states for invalid items
@@ -605,7 +638,8 @@ class HistoryEncoder(nn.Module):
         # 1
         features = []
         for img in batch[OBS_IMAGES]:
-            raw_img_features = self.hist_backbone(img) # (B, D, H_patch, W_patch)
+            with torch.no_grad():
+                raw_img_features = self.hist_backbone(img) # (B, D, H_patch, W_patch)
             img_features = self.spatial_adapter(raw_img_features)
             features.append(img_features)
 

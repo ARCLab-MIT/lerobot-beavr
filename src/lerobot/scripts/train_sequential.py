@@ -162,16 +162,6 @@ def _gather_batch(dataset, frame_indices: list[int]) -> dict:
             batch[k] = v_list
     return batch
 
-def _gather_random_batch(dataset, batch_size: int) -> dict:
-    # Sample IID frames uniformly from the full dataset range
-    frame_indices = [random.randrange(dataset.num_frames) for _ in range(batch_size)]
-    return _gather_batch(dataset, frame_indices)
-
-def _toggle_requires_grad(module: torch.nn.Module, enable: bool) -> None:
-    for p in module.parameters(recurse=True):
-        if p.requires_grad != enable:
-            p.requires_grad = enable
-
 def _splice_rows(cache, fresh, mask):
     if cache is None or fresh is None:
         return cache
@@ -196,50 +186,6 @@ def _masked_history_reset(policy, reset_mask, fresh_template=None):
     if fresh_template is None:
         fresh_template = policy.history_encoder.init_cache(reset_mask.shape[0])
     policy.history_cache = _splice_rows(policy.history_cache, fresh_template, reset_mask)
-
-
-def _check_history_encoder_grad_norm(policy, use_iid: bool, step: int, log_freq: int = 100) -> None:
-    """Check gradient norms for history encoder to verify freezing is working.
-
-    Args:
-        policy: The policy model
-        use_iid: Whether this is an IID training step
-        step: Current training step
-        log_freq: How often to log the gradient norm check
-    """
-    if not hasattr(policy, "history_encoder") or policy.history_encoder is None:
-        return
-
-    # Calculate gradient norm for history encoder parameters
-    history_grad_norm = 0.0
-    history_param_count = 0
-    for param in policy.history_encoder.parameters():
-        if param.grad is not None:
-            history_grad_norm += param.grad.data.norm(2).item() ** 2
-            history_param_count += 1
-
-    if history_param_count > 0:
-        history_grad_norm = history_grad_norm ** 0.5
-
-        # Log gradient norm check periodically
-        if step % log_freq == 0:
-            expected_behavior = "ZERO" if use_iid else "NON-ZERO"
-            actual_behavior = "ZERO" if history_grad_norm < 1e-8 else "NON-ZERO"
-            status = "✓" if (use_iid and history_grad_norm < 1e-8) or (not use_iid and history_grad_norm >= 1e-8) else "✗"
-
-            logging.info(
-                f"History encoder grad norm check [step {step}]: "
-                f"norm={history_grad_norm:.2e}, expected={expected_behavior}, "
-                f"actual={actual_behavior} {status}"
-            )
-
-            # Warning if freezing isn't working as expected
-            if use_iid and history_grad_norm >= 1e-8:
-                logging.warning(
-                    f"WARNING: History encoder should be frozen during IID training but has "
-                    f"gradient norm {history_grad_norm:.2e}"
-                )
-
 
 
 def _accumulate_step(policy: PreTrainedPolicy, batch: Any, grad_scaler: GradScaler, use_amp: bool, loss_scale: int) -> tuple[float, dict]:
@@ -295,7 +241,6 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating dataset")
     dataset = make_dataset(cfg)
-    print(f"dataset: {dataset}")
 
     # Optional eval env
     eval_env = None
@@ -330,7 +275,7 @@ def train(cfg: TrainPipelineConfig):
     batch_size = cfg.batch_size
     step_tick = cfg.policy.step_tick if cfg.policy.step_tick is not None else batch_size
 
-    iterator = LockstepEpisodeIterator(dataset.episode_data_index, B=batch_size)
+    iterator = LockstepEpisodeIterator(dataset.episode_data_index, b=batch_size)
 
     policy.train()
     meters = {
@@ -370,37 +315,21 @@ def train(cfg: TrainPipelineConfig):
             break
         tracker.dataloading_s = time.perf_counter() - t0
 
-        # Hybrid batching: 80% sequential, 20% IID
-        use_iid = random.random() < 0.2
-        if use_iid:
-            batch = _gather_random_batch(dataset, batch_size)
-        else:
-            batch = _gather_batch(dataset, frame_indices)
+        # Use sequential/streaming training
+        batch = _gather_batch(dataset, frame_indices)
 
         # Move tensors to device
         for k, v in list(batch.items()):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device, non_blocking=device.type == "cuda")
 
-        # Masked per-stream history reset (only for sequential microsteps)
-        if not use_iid:
-            _masked_history_reset(policy, reset_mask.to(device), _fresh_cache_template)
-
-        # For IID microsteps, freeze history encoder parameters (if present)
-        history_frozen = False
-        if use_iid and hasattr(policy, "history_encoder") and policy.history_encoder is not None:
-            _toggle_requires_grad(policy.history_encoder, False)
-            history_frozen = True
+        # Masked per-stream history reset for sequential training
+        _masked_history_reset(policy, reset_mask.to(device), _fresh_cache_template)
 
         # Accumulate gradients per frame
         loss_val, loss_dict = _accumulate_step(policy, batch, grad_scaler, cfg.policy.use_amp, batch_size)
 
-        # Check history encoder gradient norms to verify freezing
-        _check_history_encoder_grad_norm(policy, use_iid, step, log_freq=cfg.log_freq if cfg.log_freq > 0 else 100)
 
-        # Restore history encoder requires_grad after IID step
-        if history_frozen:
-            _toggle_requires_grad(policy.history_encoder, True)
         meters["loss"].update(loss_val)
         if "l1_loss" in loss_dict:
             meters["l1_loss"].update(loss_dict["l1_loss"])
