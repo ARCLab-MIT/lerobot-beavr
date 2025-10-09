@@ -93,8 +93,8 @@ class DACTConfigA(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 50
-    n_action_steps: int = 50
+    chunk_size: int = 16
+    n_action_steps: int = 16
     step_tick: int | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -136,12 +136,12 @@ class DACTConfigA(PreTrainedConfig):
     drop_n_first_frames: int = 0
 
     # Training preset
-    optimizer_lr: float = 3e-4
+    optimizer_lr: float = 5e-5
     scheduler_decay_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
-    num_warmup_steps: int = 1000
-    num_decay_steps: int = 5000
+    num_warmup_steps: int = 0
+    num_decay_steps: int = 20000
 
     # History encoder (Mamba-based) configuration
     history_d_state: int = 128

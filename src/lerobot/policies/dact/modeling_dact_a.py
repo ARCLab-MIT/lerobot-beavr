@@ -27,8 +27,8 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor, nn
-from torchvision.models._utils import IntermediateLayerGetter
-from torchvision.ops.misc import FrozenBatchNorm2d
+# from torchvision.models._utils import IntermediateLayerGetter
+# from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.policies.act.modeling_act import (
@@ -44,7 +44,7 @@ from lerobot.policies.normalize import Normalize, Unnormalize
 from lerobot.policies.pretrained import PreTrainedPolicy
 
 HISTORY_TOKEN = "history_token"
-
+RAW_FEATURE_MAPS = "raw_feature_maps"
 
 class DACTPolicyA(PreTrainedPolicy):
     """
@@ -80,18 +80,18 @@ class DACTPolicyA(PreTrainedPolicy):
         )
 
         # Backbone for image feature extraction.
-        if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
-            # Expose backbone output channels for consumers
-            self.backbone_out_channels = backbone_model.fc.in_features
+        # if self.config.image_features:
+        #     backbone_model = getattr(torchvision.models, config.vision_backbone)(
+        #         replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+        #         weights=config.pretrained_backbone_weights,
+        #         norm_layer=FrozenBatchNorm2d,
+        #     )
+        #     # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+        #     # feature map).
+        #     # Note: The forward method of this returns a dict: {"feature_map": output}.
+        #     self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+        #     # Expose backbone output channels for consumers
+        #     self.backbone_out_channels = backbone_model.fc.in_features
 
         self.model = DACT(config)
 
@@ -178,8 +178,8 @@ class DACTPolicyA(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         # Compute/update history token h_t
-        x_t = self.history_encoder.fuse_obs_to_history_vec(batch)
-
+        x_t, raw_feature_maps = self.history_encoder.fuse_obs_to_history_vec(batch)
+        batch[RAW_FEATURE_MAPS] = raw_feature_maps
         # Check if cache batch size matches current batch size, reinitialize if needed
         current_batch_size = x_t.shape[0]
         if self.history_cache is None:
@@ -210,8 +210,8 @@ class DACTPolicyA(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         # Compute/update history token h_t
-        x_t = self.history_encoder.fuse_obs_to_history_vec(batch)
-
+        x_t, raw_feature_maps = self.history_encoder.fuse_obs_to_history_vec(batch)
+        batch[RAW_FEATURE_MAPS] = raw_feature_maps
         # Check if cache batch size matches current batch size, reinitialize if needed
         current_batch_size = x_t.shape[0]
         if self.history_cache is None:
@@ -327,17 +327,17 @@ class DACT(nn.Module):
                 create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
             )
 
-        # Backbone for image feature extraction.
-        if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+        # # Backbone for image feature extraction.
+        # if self.config.image_features:
+        #     backbone_model = getattr(torchvision.models, config.vision_backbone)(
+        #         replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+        #         weights=config.pretrained_backbone_weights,
+        #         norm_layer=FrozenBatchNorm2d,
+        #     )
+        #     # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+        #     # feature map).
+        #     # Note: The forward method of this returns a dict: {"feature_map": output}.
+        #     self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -356,7 +356,7 @@ class DACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                config.dinov2_dim, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -481,7 +481,7 @@ class DACT(nn.Module):
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        # encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
         # Robot state token.
         if self.config.robot_state_feature:
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
@@ -492,27 +492,35 @@ class DACT(nn.Module):
         hist_token = self.encoder_history_input_proj(batch[HISTORY_TOKEN])
         encoder_in_tokens.append(hist_token)
 
+        encoder_in_tokens = torch.stack(encoder_in_tokens, dim=0)
+        encoder_in_pos_embed = self.encoder_1d_feature_pos_embed.weight.unsqueeze(1).expand(-1, batch_size, -1)
+
         if self.config.image_features:
+            cam_tokens = []
+            cam_pos_embeds = []
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+            for raw_feature_map in batch[RAW_FEATURE_MAPS]:
+                cam_pos_embed = self.encoder_cam_feat_pos_embed(raw_feature_map).to(dtype=raw_feature_map.dtype)
+                # Expand positional embedding from (1, C, H, W) to (B, C, H, W) to match batch size
+                cam_pos_embed = cam_pos_embed.expand(raw_feature_map.shape[0], -1, -1, -1)
+                cam_features = self.encoder_img_feat_input_proj(raw_feature_map)
 
                 # Rearrange features to (sequence, batch, dim).
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+                cam_tokens.append(cam_features)
+                cam_pos_embeds.append(cam_pos_embed)
 
-        # Stack all tokens along the sequence dimension.
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+            cam_tokens = torch.cat(cam_tokens, dim=0)
+            cam_pos_embeds = torch.cat(cam_pos_embeds, dim=0)
+
+            # Stack all tokens along the sequence dimension.
+            encoder_in_tokens = torch.cat([encoder_in_tokens, cam_tokens], dim=0)
+            encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, cam_pos_embeds], dim=0)
+            # encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
@@ -637,9 +645,11 @@ class HistoryEncoder(nn.Module):
         """
         # 1
         features = []
+        raw_feature_maps = []
         for img in batch[OBS_IMAGES]:
             with torch.no_grad():
                 raw_img_features = self.hist_backbone(img) # (B, D, H_patch, W_patch)
+            raw_feature_maps.append(raw_img_features)
             img_features = self.spatial_adapter(raw_img_features)
             features.append(img_features)
 
@@ -665,4 +675,4 @@ class HistoryEncoder(nn.Module):
 
         x_t = fused_features # (B, D)
 
-        return x_t
+        return x_t, raw_feature_maps
