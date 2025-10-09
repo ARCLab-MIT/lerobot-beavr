@@ -4,9 +4,9 @@ DEFAULT_CONFIG = {
     "repo_id": "user/image2image_point_action",
     "fps": 1,
     "robot_type": "custom",
-    "task_name": "point_action",
+    "task_name": "Sensor tasking",
     "input_dir": "/mnt/data/aposadasn/datafromEnrico/diff_train",
-    "output_dir": "/mnt/data/aposadasn/datafromEnrico/diff_train/lerobot_dataset",
+    "output_dir": "/home/aposadasn/lerobot-beavr/outputs/lerobot_dataset",
     # csv_image parser patterns (unused when parser_type == image_pair)
     "csv_pattern": "trajectory_{episode}.csv",
     "image_pattern": "ep_{episode}_agent_{agent}_img_{img}.png",
@@ -17,12 +17,13 @@ DEFAULT_CONFIG = {
     "use_videos": False,
     "debug": True,
     "test_mode": False,
-    "push_to_hub": False,
+    "push_to_hub": True,
     "private_repo": False,
     "tolerance_s": 1.0,
     # image_pair parser options
     "parser_type": "image_pair",
-    "input_subdir": "input_ag2",
-    "action_subdir": "action_ag2",
+    "input_subdir": "input_ag3_byepisode",
+    "action_subdir": "action_ag3_byepisode",
     "action_threshold": 200,
+    "num_agents": 3,
 }

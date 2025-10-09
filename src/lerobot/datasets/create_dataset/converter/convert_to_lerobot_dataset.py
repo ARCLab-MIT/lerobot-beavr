@@ -79,8 +79,9 @@ class DatasetConverter:
         # Process each episode
         for episode_file in tqdm(episode_files, desc="Converting episodes"):
             try:
-                episode_data = self.parser.parse_episode(episode_file)
-                self._add_episode_to_dataset(episode_data)
+                # parse_episode now returns a generator yielding episodes one by one
+                for episode_data in self.parser.parse_episode(episode_file):
+                    self._add_episode_to_dataset(episode_data)
             except Exception as e:
                 self.logger.error(f"Error processing {episode_file}: {e}")
                 if not self.config.debug:

@@ -54,6 +54,8 @@ class DatasetConfig:
     push_to_hub: bool = True
     private_repo: bool = False
 
+    num_agents: int | None = None
+
     def __post_init__(self):
         """Convert string paths to Path objects."""
         self.input_dir = Path(self.input_dir)
