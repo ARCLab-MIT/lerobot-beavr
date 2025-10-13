@@ -48,11 +48,6 @@ from lerobot.utils.utils import (
 from lerobot.utils.wandb_utils import WandBLogger
 
 
-@dataclass
-class SequentialConfig:
-    step_tick: int | None = None  # if None, defaults to B (cfg.batch_size)
-
-
 class LockstepEpisodeIterator:
     """
     Advances B episode streams in lockstep, yielding per-step frame indices and reset_mask.
@@ -183,8 +178,23 @@ def _masked_history_reset(policy, reset_mask, fresh_template=None):
         or not reset_mask.any()
     ):
         return
+    # Helper function to move tensors to device
+    def _to_device(x):
+        if isinstance(x, (tuple, list)):
+            return type(x)(_to_device(t) for t in x)
+        return x.to(reset_mask.device) if torch.is_tensor(x) else x
+
     if fresh_template is None:
         fresh_template = policy.history_encoder.init_cache(reset_mask.shape[0])
+        fresh_template = _to_device(fresh_template)
+
+    # Check if cache batch size matches reset_mask batch size, reinitialize if needed
+    current_batch_size = reset_mask.shape[0]
+    cache_batch_size = policy.history_cache[0].shape[0] if policy.history_cache[0] is not None else 0
+    if cache_batch_size != current_batch_size:
+        policy.history_cache = policy.history_encoder.init_cache(current_batch_size)
+        policy.history_cache = _to_device(policy.history_cache)
+
     policy.history_cache = _splice_rows(policy.history_cache, fresh_template, reset_mask)
 
 
@@ -273,7 +283,6 @@ def train(cfg: TrainPipelineConfig):
 
     # Sequential training batch size
     batch_size = cfg.batch_size
-    step_tick = cfg.policy.step_tick if cfg.policy.step_tick is not None else batch_size
 
     iterator = LockstepEpisodeIterator(dataset.episode_data_index, b=batch_size)
 
@@ -303,9 +312,6 @@ def train(cfg: TrainPipelineConfig):
                 return type(x)(_to(t) for t in x)
             return x.to(device) if torch.is_tensor(x) else x
         policy.history_cache = _to(policy.history_cache)
-        _fresh_cache_template = policy.history_encoder.init_cache(batch_size)
-    else:
-        _fresh_cache_template = None
 
     while step < cfg.steps:
         t0 = time.perf_counter()
@@ -315,30 +321,12 @@ def train(cfg: TrainPipelineConfig):
             break
         tracker.dataloading_s = time.perf_counter() - t0
 
-        # Use sequential/streaming training
-        batch = _gather_batch(dataset, frame_indices)
+        # If any stream is starting a new episode, step optimizer BEFORE processing the new episode
+        # This ensures gradients from different episodes don't get mixed
+        any_stream_starting_new_episode = bool(reset_mask.any())
+        should_step_before_reset = any_stream_starting_new_episode and frames_since_step > 0
 
-        # Move tensors to device
-        for k, v in list(batch.items()):
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.to(device, non_blocking=device.type == "cuda")
-
-        # Masked per-stream history reset for sequential training
-        _masked_history_reset(policy, reset_mask.to(device), _fresh_cache_template)
-
-        # Accumulate gradients per frame
-        loss_val, loss_dict = _accumulate_step(policy, batch, grad_scaler, cfg.policy.use_amp, batch_size)
-
-
-        meters["loss"].update(loss_val)
-        if "l1_loss" in loss_dict:
-            meters["l1_loss"].update(loss_dict["l1_loss"])
-        if "kld_loss" in loss_dict:
-            meters["kld_loss"].update(loss_dict["kld_loss"])
-        frames_since_step += batch_size
-
-        # Optimizer step when we hit step_tick frames
-        if frames_since_step >= step_tick:
+        if should_step_before_reset:
             duration = time.perf_counter() - episode_start_time
             grad_norm = _optimizer_step(
                 policy=policy,
@@ -355,7 +343,107 @@ def train(cfg: TrainPipelineConfig):
             tracker.grad_norm = grad_norm
             tracker.lr = optimizer.param_groups[0]["lr"]
             if duration > 0:
-                tracker.frame_s = duration / max(step_tick, 1)
+                tracker.frame_s = duration / max(batch_size, 1)
+            tracker.step()
+
+            is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+            is_saving_step = cfg.save_freq > 0 and (step % cfg.save_freq == 0 or step == cfg.steps)
+            is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+
+            if is_log_step:
+                logging.info(tracker)
+                if wandb_logger:
+                    wandb_log_dict = tracker.to_dict()
+                    # Include accumulated loss_dict components like in train.py
+                    if hasattr(tracker, 'step_loss_dict'):
+                        wandb_log_dict.update(tracker.step_loss_dict)
+                    wandb_logger.log_dict(wandb_log_dict, step)
+                tracker.reset_averages()
+                # Reset the accumulated loss_dict for the next step
+                if hasattr(tracker, 'step_loss_dict'):
+                    tracker.step_loss_dict = {}
+
+            if cfg.save_checkpoint and is_saving_step:
+                logging.info(f"Checkpoint policy after step {step}")
+                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, lr_scheduler)
+                update_last_checkpoint(checkpoint_dir)
+                if wandb_logger:
+                    wandb_logger.log_policy(checkpoint_dir)
+
+            if cfg.env and is_eval_step and eval_env is not None:
+                step_id = get_step_identifier(step, cfg.steps)
+                logging.info(f"Eval policy at step {step}")
+                with (
+                    torch.no_grad(),
+                    torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext(),
+                ):
+                    eval_info = eval_policy(
+                        eval_env,
+                        policy,
+                        cfg.eval.n_episodes,
+                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                        max_episodes_rendered=4,
+                        start_seed=cfg.seed,
+                    )
+                eval_metrics = {
+                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                    "pc_success": AverageMeter("success", ":.1f"),
+                    "eval_s": AverageMeter("eval_s", ":.3f"),
+                }
+                eval_tracker = MetricsTracker(batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step)
+                eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
+                eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
+                eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
+                logging.info(eval_tracker)
+                if wandb_logger:
+                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                    wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
+
+            if step >= cfg.steps:
+                break
+
+        # Use sequential/streaming training
+        batch = _gather_batch(dataset, frame_indices)
+
+        # Move tensors to device
+        for k, v in list(batch.items()):
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(device, non_blocking=device.type == "cuda")
+
+        # Masked per-stream history reset for sequential training
+        _masked_history_reset(policy, reset_mask.to(device), fresh_template=None)
+
+        # Accumulate gradients per frame
+        loss_val, loss_dict = _accumulate_step(policy, batch, grad_scaler, cfg.policy.use_amp, batch_size)
+
+        meters["loss"].update(loss_val)
+        if "l1_loss" in loss_dict:
+            meters["l1_loss"].update(loss_dict["l1_loss"])
+        if "kld_loss" in loss_dict:
+            meters["kld_loss"].update(loss_dict["kld_loss"])
+        frames_since_step += batch_size
+
+        # Optimizer step when we hit step_tick frames
+        if frames_since_step >= batch_size:
+            duration = time.perf_counter() - episode_start_time
+            grad_norm = _optimizer_step(
+                policy=policy,
+                optimizer=optimizer,
+                grad_scaler=grad_scaler,
+                lr_scheduler=lr_scheduler,
+                grad_clip_norm=cfg.optimizer.grad_clip_norm,
+                denom=1,
+            )
+            step += 1
+            frames_since_step = 0
+            episode_start_time = time.perf_counter()
+
+            tracker.grad_norm = grad_norm
+            tracker.lr = optimizer.param_groups[0]["lr"]
+            if duration > 0:
+                tracker.frame_s = duration / max(batch_size, 1)
             tracker.step()
 
             is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0

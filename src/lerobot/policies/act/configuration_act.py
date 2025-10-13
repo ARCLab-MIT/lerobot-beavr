@@ -132,7 +132,6 @@ class ACTConfig(PreTrainedConfig):
     dropout: float = 0.1
     kl_weight: float = 10.0
     drop_n_first_frames: int = 0
-    step_tick: int | None = None
 
     # Training preset
     optimizer_lr: float = 1e-5

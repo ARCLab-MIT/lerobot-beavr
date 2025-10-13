@@ -93,9 +93,10 @@ class DACTConfigA(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 16
-    n_action_steps: int = 16
-    step_tick: int | None = None
+    chunk_size: int = 100
+    n_action_steps: int = 100
+    window_size: int = 2
+    step_tick: int = 1000000
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -110,6 +111,9 @@ class DACTConfigA(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # Output channels of the visual backbone feature map fed into the policy
+    # For ResNet18 layer4 this is 512; adjust if you change backbones (e.g., 2048 for ResNet50)
+    image_backbone_out_channels: int = 512
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -133,34 +137,25 @@ class DACTConfigA(PreTrainedConfig):
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 1.0
+    l1_weight: float = 1.0
     drop_n_first_frames: int = 0
+    freeze_history: bool = False
 
     # Training preset
-    optimizer_lr: float = 5e-5
-    scheduler_decay_lr: float = 1e-5
-    optimizer_weight_decay: float = 1e-4
+    optimizer_lr: float = 1e-5
+    scheduler_decay_lr: float = 1e-6
+    optimizer_weight_decay: float = 1e-5
     optimizer_lr_backbone: float = 1e-5
     num_warmup_steps: int = 0
-    num_decay_steps: int = 20000
+    num_decay_steps: int = 10000
 
     # History encoder (Mamba-based) configuration
-    history_d_state: int = 128
+    history_d_state: int = 512
     history_d_conv: int = 4
     history_expand: int = 2
-    history_headdim: int = 64
+    history_headdim: int = 128
     history_use_mem_eff_path: bool = True
 
-    # Mamba-2
-    d_state: int = 128
-    d_conv: int = 4
-    expand: int = 2
-    headdim: int = 64
-    use_mem_eff_path: bool = True
-    shuffle: bool = False
-    patch_size: int = 14
-    layer_index: int = -4
-    # DINOv2 ViT-L/14 feature dimension (matches FrozenDinov2 output channels)
-    dinov2_dim: int = 1024
     num_cameras: int = 1
 
 

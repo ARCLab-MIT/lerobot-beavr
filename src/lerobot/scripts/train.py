@@ -51,7 +51,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 from lerobot.utils.wandb_utils import WandBLogger
-from lerobot.constants import OBS_STATE
+
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -104,44 +104,6 @@ def update_policy(
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
-def accumulate_step(
-    policy: PreTrainedPolicy,
-    batch: Any,
-    grad_scaler: GradScaler,
-    use_amp: bool,
-) -> tuple[float, dict]:
-    device = get_device_from_parameters(policy)
-    policy.train()
-    with torch.autocast(device_type=device.type) if use_amp else nullcontext():
-        loss, output_dict = policy.forward(batch)
-    grad_scaler.scale(loss).backward()
-    return float(loss.item()), output_dict
-
-def optimizer_step_only(
-    policy: PreTrainedPolicy,
-    optimizer: Optimizer,
-    grad_scaler: GradScaler,
-    lr_scheduler,
-    grad_clip_norm: float,
-    episode_length: int = 1,
-) -> float:
-    grad_scaler.unscale_(optimizer)
-
-    # Normalize gradients by episode length to ensure consistent step size
-    # regardless of episode length
-    if episode_length > 0:
-        for param_group in optimizer.param_groups:
-            for param in param_group['params']:
-                if param.grad is not None:
-                    param.grad.data.mul_(1.0 / episode_length)
-
-    grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip_norm, error_if_nonfinite=False)
-    grad_scaler.step(optimizer)
-    grad_scaler.update()
-    optimizer.zero_grad()
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-    return float(grad_norm)
 
 @parser.wrap()
 def train(cfg: TrainPipelineConfig):
@@ -164,7 +126,6 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating dataset")
     dataset = make_dataset(cfg)
-    print(f"cfg: {cfg}")
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -179,6 +140,15 @@ def train(cfg: TrainPipelineConfig):
         cfg=cfg.policy,
         ds_meta=dataset.meta,
     )
+
+    for p in policy.history_encoder.mamba.parameters():
+        p.requires_grad = False
+
+    for p in policy.history_encoder.hist_backbone.parameters():
+        p.requires_grad = True
+
+    for p in policy.history_encoder.spatial_adapter.parameters():
+        p.requires_grad = True
 
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -203,16 +173,15 @@ def train(cfg: TrainPipelineConfig):
 
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
-        # Strict ordering inside each episode, no shuffling.
+        shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.episode_data_index,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=False,  # <<< must be False to preserve temporal order
+            shuffle=True,
         )
-        shuffle = False
     else:
+        shuffle = True
         sampler = None
-        shuffle = False  # <<< force off to preserve order even without sampler
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -231,185 +200,92 @@ def train(cfg: TrainPipelineConfig):
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
-        "episode_s": AverageMeter("ep_s", ":.3f"),
-        "frame_s": AverageMeter("frm_s", ":.3f"),
+        "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
-        "episode_length": AverageMeter("ep_len", ":1.0f"),
     }
 
     train_tracker = MetricsTracker(
         cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
     )
 
-    # State for episode-aware stepping
-    first_frame_seen = False
-    episode_loss_sum = 0.0
-    episode_frame_count = 0
-    last_output_dict = {}
-    current_episode_length = 0
-    episode_start_time = None
-    prev_episode_index = 0  # Track previous episode_index for boundary detection
-
     logging.info("Start offline training on a fixed dataset")
-    # Interpret cfg.steps as "number of optimizer updates" (i.e., episodes)
-    while step < cfg.steps:
-        # -------------------- get next frame --------------------
-        t0 = time.perf_counter()
+    for _ in range(step, cfg.steps):
+        start_time = time.perf_counter()
         batch = next(dl_iter)
-        train_tracker.dataloading_s = time.perf_counter() - t0
+        train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        # Boundary detection using episode_index field
-        # This is much simpler and more reliable than index-based detection
-        current_episode_index = batch["episode_index"].item()
-        is_boundary = (current_episode_index != prev_episode_index)
-        
-        # Debug: Log wrap-around detection
-        if is_boundary and first_frame_seen and current_episode_index < prev_episode_index:
-            logging.info(f"[WRAP-AROUND DETECTED] prev_ep={prev_episode_index} -> current_ep={current_episode_index} at step={step}")
+        for key in batch:
+            if isinstance(batch[key], torch.Tensor):
+                batch[key] = batch[key].to(device, non_blocking=device.type == "cuda")
 
-
-        # If we encounter the start of a *new* episode and this isn't the very first frame
-        # we've processed, we finalize the previous episode: clip+step+zero+sched+log.
-        if is_boundary and first_frame_seen:
-            # Record episode completion time
-            episode_end_time = time.perf_counter()
-            episode_duration = episode_end_time - episode_start_time if episode_start_time else 0
-
-            grad_norm = optimizer_step_only(
-                policy=policy,
-                optimizer=optimizer,
-                grad_scaler=grad_scaler,
-                lr_scheduler=lr_scheduler,
-                grad_clip_norm=cfg.optimizer.grad_clip_norm,
-                episode_length=current_episode_length,
-            )
-            # bookkeeping for this optimizer update (= one episode)
-            step += 1
-
-            # Update episode-level metrics
-            train_tracker.episode_s = episode_duration
-            train_tracker.episode_length = current_episode_length
-            if current_episode_length > 0:
-                train_tracker.frame_s = episode_duration / current_episode_length
-                # Calculate throughput metrics
-                frames_per_sec = current_episode_length / episode_duration if episode_duration > 0 else 0
-
-            train_tracker.grad_norm = grad_norm
-            train_tracker.lr = optimizer.param_groups[0]["lr"]
-            train_tracker.step()
-
-            # ---------- logging / checkpoint / eval happen on optimizer steps ----------
-            is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-            is_saving_step = cfg.save_freq > 0 and (step % cfg.save_freq == 0 or step == cfg.steps)
-            is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
-
-            if is_log_step:
-                # Log episode-averaged loss (normalized by number of frames)
-                if episode_frame_count > 0:
-                    episode_avg_loss = episode_loss_sum / episode_frame_count
-                    train_tracker.loss = episode_avg_loss
-                    # Debug: Check for suspicious loss values
-                    if episode_avg_loss < 0.001 or episode_avg_loss == 0.0:
-                        logging.warning(f"[SUSPICIOUS LOSS] step={step}, loss={episode_avg_loss:.6f}, "
-                                      f"episode_loss_sum={episode_loss_sum:.6f}, episode_frame_count={episode_frame_count}")
-                else:
-                    logging.warning(f"[NO FRAMES] step={step}, episode_frame_count=0, cannot compute loss")
-                logging.info(train_tracker)
-                if wandb_logger:
-                    wandb_log = train_tracker.to_dict()
-                    if last_output_dict:
-                        wandb_log.update(last_output_dict)
-                    wandb_logger.log_dict(wandb_log, step)
-                train_tracker.reset_averages()
-
-            if cfg.save_checkpoint and is_saving_step:
-                logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, lr_scheduler)
-                update_last_checkpoint(checkpoint_dir)
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
-
-            if cfg.env and is_eval_step:
-                step_id = get_step_identifier(step, cfg.steps)
-                logging.info(f"Eval policy at step {step}")
-                with (
-                    torch.no_grad(),
-                    torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext(),
-                ):
-                    eval_info = eval_policy(
-                        eval_env,
-                        policy,
-                        cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
-                        start_seed=cfg.seed,
-                    )
-                eval_metrics = {
-                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
-                    "pc_success": AverageMeter("success", ":.1f"),
-                    "eval_s": AverageMeter("eval_s", ":.3f"),
-                }
-                eval_tracker = MetricsTracker(
-                    cfg.batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step
-                )
-                eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
-                eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
-                eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
-                logging.info(eval_tracker)
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
-
-            # If we've reached the target number of optimizer steps, stop training.
-            if step >= cfg.steps:
-                break
-
-            # We just started a new episode → reset recurrent state/history and timing
-            policy.reset()
-            # Reset episode length counter, loss tracking, and timing for new episode
-            current_episode_length = 0
-            episode_loss_sum = 0.0
-            episode_frame_count = 0
-            episode_start_time = time.perf_counter()
-
-        # First frame ever (seed episode): reset before accumulating
-        if not first_frame_seen:
-            policy.reset()
-            first_frame_seen = True
-            # Initialize episode timing for the first episode
-            episode_start_time = time.perf_counter()
-
-        # -------------------- move to device & accumulate this frame --------------------
-        for k, v in list(batch.items()):
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.to(device, non_blocking=device.type == "cuda")
-
-        loss_val, output_dict = accumulate_step(
-            policy=policy,
-            batch=batch,
+        train_tracker, output_dict = update_policy(
+            train_tracker,
+            policy,
+            batch,
+            optimizer,
+            cfg.optimizer.grad_clip_norm,
             grad_scaler=grad_scaler,
+            lr_scheduler=lr_scheduler,
             use_amp=cfg.policy.use_amp,
         )
-        # Accumulate loss for episode averaging
-        episode_loss_sum += loss_val
-        episode_frame_count += 1
-        last_output_dict = output_dict
-        
-        # Debug: Log frames with suspicious loss
-        if loss_val < 0.001 or loss_val == 0.0:
-            num_valid_actions = (~batch["action_is_pad"]).sum().item()
-            logging.warning(f"[FRAME WITH ZERO LOSS] step={step}, ep_idx={current_episode_index}, "
-                          f"loss={loss_val:.6f}, valid_actions={num_valid_actions}, "
-                          f"frame_count={episode_frame_count}")
 
-        # Track episode length for gradient normalization
-        current_episode_length += 1
-        
-        # Update prev_episode_index after processing this frame
-        # (Critical: must be after processing so boundary detection works correctly next iteration)
-        prev_episode_index = current_episode_index
+        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+        # increment `step` here.
+        step += 1
+        train_tracker.step()
+        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+
+        if is_log_step:
+            logging.info(train_tracker)
+            if wandb_logger:
+                wandb_log_dict = train_tracker.to_dict()
+                if output_dict:
+                    wandb_log_dict.update(output_dict)
+                wandb_logger.log_dict(wandb_log_dict, step)
+            train_tracker.reset_averages()
+
+        if cfg.save_checkpoint and is_saving_step:
+            logging.info(f"Checkpoint policy after step {step}")
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, lr_scheduler)
+            update_last_checkpoint(checkpoint_dir)
+            if wandb_logger:
+                wandb_logger.log_policy(checkpoint_dir)
+
+        if cfg.env and is_eval_step:
+            step_id = get_step_identifier(step, cfg.steps)
+            logging.info(f"Eval policy at step {step}")
+            with (
+                torch.no_grad(),
+                torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext(),
+            ):
+                eval_info = eval_policy(
+                    eval_env,
+                    policy,
+                    cfg.eval.n_episodes,
+                    videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                    max_episodes_rendered=4,
+                    start_seed=cfg.seed,
+                )
+
+            eval_metrics = {
+                "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                "pc_success": AverageMeter("success", ":.1f"),
+                "eval_s": AverageMeter("eval_s", ":.3f"),
+            }
+            eval_tracker = MetricsTracker(
+                cfg.batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step
+            )
+            eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
+            eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
+            eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
+            logging.info(eval_tracker)
+            if wandb_logger:
+                wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
 
     if eval_env:
         eval_env.close()
@@ -419,10 +295,6 @@ def train(cfg: TrainPipelineConfig):
         policy.push_model_to_hub(cfg)
 
 
-def main():
+if __name__ == "__main__":
     init_logging()
     train()
-
-
-if __name__ == "__main__":
-    main()

@@ -27,8 +27,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor, nn
-# from torchvision.models._utils import IntermediateLayerGetter
-# from torchvision.ops.misc import FrozenBatchNorm2d
+
 
 from lerobot.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.policies.act.modeling_act import (
@@ -39,6 +38,8 @@ from lerobot.policies.act.modeling_act import (
     create_sinusoidal_pos_embedding,
 )
 from lerobot.policies.dact.configuration_dact_a import DACTConfigA
+from torchvision.models._utils import IntermediateLayerGetter
+from torchvision.ops.misc import FrozenBatchNorm2d
 from lerobot.policies.dact.mamba_policy import Mamba2, FrozenDinov2, CrossCameraAttention, CrossModalAttention
 from lerobot.policies.normalize import Normalize, Unnormalize
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -71,6 +72,8 @@ class DACTPolicyA(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
+        self.freeze_history = config.freeze_history
+
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
@@ -79,29 +82,12 @@ class DACTPolicyA(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
-        # Backbone for image feature extraction.
-        # if self.config.image_features:
-        #     backbone_model = getattr(torchvision.models, config.vision_backbone)(
-        #         replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-        #         weights=config.pretrained_backbone_weights,
-        #         norm_layer=FrozenBatchNorm2d,
-        #     )
-        #     # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-        #     # feature map).
-        #     # Note: The forward method of this returns a dict: {"feature_map": output}.
-        #     self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
-        #     # Expose backbone output channels for consumers
-        #     self.backbone_out_channels = backbone_model.fc.in_features
-
         self.model = DACT(config)
 
         # History encoder
         self.history_encoder = HistoryEncoder(
             config=config,
         )
-        self.history_encoder.hist_backbone.eval()
-        for param in self.history_encoder.hist_backbone.parameters():
-            param.requires_grad = False
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -109,21 +95,21 @@ class DACTPolicyA(PreTrainedPolicy):
         self.reset()
 
     def get_optim_params(self) -> dict:
-        # TODO(aliberts, rcadene): As of now, lr_backbone == lr
-        # Should we remove this and just `return self.parameters()`?
+        # Separate backbone parameters (history encoder backbone) from other parameters
+        # to allow different learning rates for backbone vs other components
         return [
             {
                 "params": [
                     p
                     for n, p in self.named_parameters()
-                    if not n.startswith("model.backbone") and p.requires_grad
+                    if not n.startswith("history_encoder.hist_backbone") and p.requires_grad
                 ]
             },
             {
                 "params": [
                     p
                     for n, p in self.named_parameters()
-                    if n.startswith("model.backbone") and p.requires_grad
+                    if n.startswith("history_encoder.hist_backbone") and p.requires_grad
                 ],
                 "lr": self.config.optimizer_lr_backbone,
             },
@@ -180,24 +166,30 @@ class DACTPolicyA(PreTrainedPolicy):
         # Compute/update history token h_t
         x_t, raw_feature_maps = self.history_encoder.fuse_obs_to_history_vec(batch)
         batch[RAW_FEATURE_MAPS] = raw_feature_maps
-        # Check if cache batch size matches current batch size, reinitialize if needed
-        current_batch_size = x_t.shape[0]
-        if self.history_cache is None:
-            self.history_cache = self.history_encoder.init_cache(current_batch_size)
+
+        if self.freeze_history:
+            h_t = x_t
+            self.history_cache = None
         else:
-            # Check if cache batch size matches current batch size
-            cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
-            if cache_batch_size != current_batch_size:
+            # Check if cache batch size matches current batch size, reinitialize if needed
+            current_batch_size = x_t.shape[0]
+            if self.history_cache is None:
                 self.history_cache = self.history_encoder.init_cache(current_batch_size)
+            else:
+                # Check if cache batch size matches current batch size
+                cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
+                if cache_batch_size != current_batch_size:
+                    self.history_cache = self.history_encoder.init_cache(current_batch_size)
 
-        # Ensure cache is on the same device as input
-        if hasattr(self.history_cache[0], 'device'):
-            target_device = x_t.device
-            if self.history_cache[0].device != target_device:
-                self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
-                                          for cache in self.history_cache)
+            # Ensure cache is on the same device as input
+            if hasattr(self.history_cache[0], 'device'):
+                target_device = x_t.device
+                if self.history_cache[0].device != target_device:
+                    self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
+                                            for cache in self.history_cache)
 
-        h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
+            h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
+
         batch[HISTORY_TOKEN] = h_t
 
         actions = self.model(batch)[0]
@@ -212,24 +204,30 @@ class DACTPolicyA(PreTrainedPolicy):
         # Compute/update history token h_t
         x_t, raw_feature_maps = self.history_encoder.fuse_obs_to_history_vec(batch)
         batch[RAW_FEATURE_MAPS] = raw_feature_maps
-        # Check if cache batch size matches current batch size, reinitialize if needed
-        current_batch_size = x_t.shape[0]
-        if self.history_cache is None:
-            self.history_cache = self.history_encoder.init_cache(current_batch_size)
+
+        if self.freeze_history:
+            h_t = x_t
+            self.history_cache = None
         else:
-            # Check if cache batch size matches current batch size
-            cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
-            if cache_batch_size != current_batch_size:
+            # Check if cache batch size matches current batch size, reinitialize if needed
+            current_batch_size = x_t.shape[0]
+            if self.history_cache is None:
                 self.history_cache = self.history_encoder.init_cache(current_batch_size)
+            else:
+                # Check if cache batch size matches current batch size
+                cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
+                if cache_batch_size != current_batch_size:
+                    self.history_cache = self.history_encoder.init_cache(current_batch_size)
 
-        # Ensure cache is on the same device as input
-        if hasattr(self.history_cache[0], 'device'):
-            target_device = x_t.device
-            if self.history_cache[0].device != target_device:
-                self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
-                                          for cache in self.history_cache)
-
-        h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
+            # Ensure cache is on the same device as input
+            if hasattr(self.history_cache[0], 'device'):
+                target_device = x_t.device
+                if self.history_cache[0].device != target_device:
+                    self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
+                                            for cache in self.history_cache)
+            
+            # Step the history encoder
+            h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
 
         batch[HISTORY_TOKEN] = h_t
 
@@ -252,7 +250,7 @@ class DACTPolicyA(PreTrainedPolicy):
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
-            loss = l1_loss + mean_kld * self.config.kl_weight
+            loss = l1_loss * self.config.l1_weight + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
 
@@ -355,8 +353,9 @@ class DACT(nn.Module):
             )
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
+            # Project visual backbone feature maps (C_backbone -> dim_model)
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                config.dinov2_dim, config.dim_model, kernel_size=1
+                self.config.image_backbone_out_channels, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -387,7 +386,7 @@ class DACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def forward(self, batch: dict[str, Tensor], freeze_history: bool = True) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -564,13 +563,13 @@ class HistoryEncoder(nn.Module):
             use_mem_eff_path=config.history_use_mem_eff_path,
         )
         self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(config.dinov2_dim, 512, 3, padding=1), #[B, 512, 45, 34]
+            nn.Conv2d(config.image_backbone_out_channels, 512, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(512, 256, 3, padding=1), #[B, 256, 45, 34]
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),
+            nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(1),
-            nn.Linear(128*23*18, config.dim_model),  # (B, D)
+            nn.Linear(256, config.dim_model),  # (B, D)
             nn.LayerNorm(config.dim_model),
             nn.ReLU(inplace=True),
             nn.Dropout(0.10)
@@ -578,7 +577,20 @@ class HistoryEncoder(nn.Module):
 
         self.config = config
         self.num_cameras = config.num_cameras
-        self.hist_backbone = FrozenDinov2(config)
+        # Backbone for image feature extraction.
+        if self.config.image_features:
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                weights=config.pretrained_backbone_weights,
+                norm_layer=FrozenBatchNorm2d,
+            )
+            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+            # feature map).
+            # Note: The forward method of this returns a dict: {"feature_map": output}.
+            self.hist_backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            # Expose backbone output channels for consumers
+            self.hist_backbone_out_channels = backbone_model.fc.in_features
+        # self.hist_backbone = FrozenDinov2(config)
         self.in_dim = config.dim_model * self.num_cameras
         self.cross_camera_attn = self.cross_cam_attn = CrossCameraAttention(config)
         self.cross_modal_attn = CrossModalAttention(config)
@@ -610,9 +622,8 @@ class HistoryEncoder(nn.Module):
         # Treat prior cache as constants
         conv_state = conv_state.detach()
         ssm_state = ssm_state.detach()
-        # When history encoder is frozen, detach x_t to prevent gradient flow from vision backbone
-        if not any(p.requires_grad for p in self.parameters()):
-            x_t = x_t.detach()
+        # Allow gradient flow through the vision backbone for training
+        # Removed gradient blocking to enable backbone training
 
         h_t, new_conv, new_ssm = self.mamba.step(x_t.unsqueeze(1), conv_state, ssm_state)
         # if valid_mask is not None:
@@ -647,8 +658,8 @@ class HistoryEncoder(nn.Module):
         features = []
         raw_feature_maps = []
         for img in batch[OBS_IMAGES]:
-            with torch.no_grad():
-                raw_img_features = self.hist_backbone(img) # (B, D, H_patch, W_patch)
+            raw = self.hist_backbone(img)  # dict with key "feature_map"
+            raw_img_features = raw["feature_map"]
             raw_feature_maps.append(raw_img_features)
             img_features = self.spatial_adapter(raw_img_features)
             features.append(img_features)
