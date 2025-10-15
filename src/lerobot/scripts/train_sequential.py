@@ -14,7 +14,6 @@ import random
 import time
 from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -198,12 +197,12 @@ def _masked_history_reset(policy, reset_mask, fresh_template=None):
     policy.history_cache = _splice_rows(policy.history_cache, fresh_template, reset_mask)
 
 
-def _accumulate_step(policy: PreTrainedPolicy, batch: Any, grad_scaler: GradScaler, use_amp: bool, loss_scale: int) -> tuple[float, dict]:
+def _accumulate_step(policy: PreTrainedPolicy, batch: Any, grad_scaler: GradScaler, use_amp: bool) -> tuple[float, dict]:
     device = get_device_from_parameters(policy)
     policy.train()
     with torch.autocast(device_type=device.type) if use_amp else nullcontext():
         loss, loss_dict = policy.forward(batch)
-        loss = loss / loss_scale
+        # Loss is already normalized in the model, no need to scale here
     grad_scaler.scale(loss).backward()
     return float(loss.item()), loss_dict
 
@@ -217,11 +216,11 @@ def _optimizer_step(
     denom: int,
 ) -> float:
     grad_scaler.unscale_(optimizer)
-    if denom > 0:
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if p.grad is not None:
-                    p.grad.data.mul_(1.0 / denom)
+    denom = max(denom, 1)
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p.grad is not None:
+                p.grad.data.mul_(1.0 / denom)
     grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip_norm, error_if_nonfinite=False)
     grad_scaler.step(optimizer)
     grad_scaler.update()
@@ -312,6 +311,9 @@ def train(cfg: TrainPipelineConfig):
                 return type(x)(_to(t) for t in x)
             return x.to(device) if torch.is_tensor(x) else x
         policy.history_cache = _to(policy.history_cache)
+    
+    # Number of backward()s since last optimizer step
+    acc_steps = 0
 
     while step < cfg.steps:
         t0 = time.perf_counter()
@@ -334,9 +336,10 @@ def train(cfg: TrainPipelineConfig):
                 grad_scaler=grad_scaler,
                 lr_scheduler=lr_scheduler,
                 grad_clip_norm=cfg.optimizer.grad_clip_norm,
-                denom=1,
+                denom=acc_steps,
             )
             step += 1
+            acc_steps = 0
             frames_since_step = 0
             episode_start_time = time.perf_counter()
 
@@ -416,7 +419,14 @@ def train(cfg: TrainPipelineConfig):
         _masked_history_reset(policy, reset_mask.to(device), fresh_template=None)
 
         # Accumulate gradients per frame
-        loss_val, loss_dict = _accumulate_step(policy, batch, grad_scaler, cfg.policy.use_amp, batch_size)
+        loss_val, loss_dict = _accumulate_step(
+            policy=policy,
+            batch=batch,
+            grad_scaler=grad_scaler,
+            use_amp=cfg.policy.use_amp,
+        )
+        # Count the number of accumulated steps
+        acc_steps += 1
 
         meters["loss"].update(loss_val)
         if "l1_loss" in loss_dict:
@@ -425,77 +435,18 @@ def train(cfg: TrainPipelineConfig):
             meters["kld_loss"].update(loss_dict["kld_loss"])
         frames_since_step += batch_size
 
-        # Optimizer step when we hit step_tick frames
-        if frames_since_step >= batch_size:
-            duration = time.perf_counter() - episode_start_time
-            grad_norm = _optimizer_step(
-                policy=policy,
-                optimizer=optimizer,
-                grad_scaler=grad_scaler,
-                lr_scheduler=lr_scheduler,
-                grad_clip_norm=cfg.optimizer.grad_clip_norm,
-                denom=1,
-            )
-            step += 1
-            frames_since_step = 0
-            episode_start_time = time.perf_counter()
-
-            tracker.grad_norm = grad_norm
-            tracker.lr = optimizer.param_groups[0]["lr"]
-            if duration > 0:
-                tracker.frame_s = duration / max(batch_size, 1)
-            tracker.step()
-
-            is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-            is_saving_step = cfg.save_freq > 0 and (step % cfg.save_freq == 0 or step == cfg.steps)
-            is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
-
-            if is_log_step:
-                logging.info(tracker)
-                if wandb_logger:
-                    wandb_logger.log_dict(tracker.to_dict(), step)
-                tracker.reset_averages()
-
-            if cfg.save_checkpoint and is_saving_step:
-                logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, lr_scheduler)
-                update_last_checkpoint(checkpoint_dir)
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
-
-            if cfg.env and is_eval_step and eval_env is not None:
-                step_id = get_step_identifier(step, cfg.steps)
-                logging.info(f"Eval policy at step {step}")
-                with (
-                    torch.no_grad(),
-                    torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext(),
-                ):
-                    eval_info = eval_policy(
-                        eval_env,
-                        policy,
-                        cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
-                        start_seed=cfg.seed,
-                    )
-                eval_metrics = {
-                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
-                    "pc_success": AverageMeter("success", ":.1f"),
-                    "eval_s": AverageMeter("eval_s", ":.3f"),
-                }
-                eval_tracker = MetricsTracker(batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step)
-                eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
-                eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
-                eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
-                logging.info(eval_tracker)
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
-
         if step >= cfg.steps:
             break
+
+    if acc_steps > 0:
+        _ = _optimizer_step(
+            policy=policy,
+            optimizer=optimizer,
+            grad_scaler=grad_scaler,
+            lr_scheduler=lr_scheduler,
+            grad_clip_norm=cfg.optimizer.grad_clip_norm,
+            denom=acc_steps,
+        )
 
     if eval_env:
         eval_env.close()
