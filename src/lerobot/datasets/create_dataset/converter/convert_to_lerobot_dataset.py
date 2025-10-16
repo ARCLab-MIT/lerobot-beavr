@@ -8,6 +8,7 @@ Performance optimizations:
 
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -90,6 +91,11 @@ class DatasetConverter:
         episode_files = self.parser.get_episode_files()
         episode_numbers = getattr(self.parser, "list_episode_numbers", lambda: [])()
         use_episode_numbers = bool(episode_numbers)
+        
+        self.logger.info(f"Episode detection: files={len(episode_files)}, numbers={len(episode_numbers)}")
+        if episode_numbers:
+            self.logger.info(f"Found episodes: {episode_numbers[:10]}{'...' if len(episode_numbers) > 10 else ''}")
+        
         if not episode_files and not use_episode_numbers:
             raise ValueError(f"No episode files found in {self.config.input_dir}")
 
@@ -210,6 +216,7 @@ class DatasetConverter:
     def _add_episode_to_dataset(self, episode_data: dict[str, Any]) -> None:
         """Add parsed episode data to the dataset."""
         num_frames = len(episode_data["timestamps"])
+        start_time = time.time()
 
         for frame_idx in range(num_frames):
             frame = self._create_frame(episode_data, frame_idx)
@@ -224,8 +231,12 @@ class DatasetConverter:
             self.dataset.add_frame(frame)
 
         # Save the complete episode
+        save_start = time.time()
         self.dataset.save_episode()
-        self.logger.debug(f"Saved episode with {num_frames} frames")
+        save_time = time.time() - save_start
+        total_time = time.time() - start_time
+        
+        self.logger.debug(f"Saved episode with {num_frames} frames - total: {total_time:.2f}s, save: {save_time:.2f}s")
 
     def _create_frame(self, episode_data: dict[str, Any], frame_idx: int) -> dict[str, Any]:
         """Create a frame dictionary from episode data."""

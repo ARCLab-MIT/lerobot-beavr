@@ -91,15 +91,21 @@ class ImagePairParser(DataParser):
         """
         input_dir = self.config.input_dir / self.input_subdir
         if not input_dir.exists():
+            self.logger.warning(f"Input directory does not exist: {input_dir}")
             return []
+        
         episode_nums: set[int] = set()
         import re
+        file_count = 0
         for p in input_dir.iterdir():
             if not p.is_file():
                 continue
+            file_count += 1
             m = re.search(r"ep_(\d+)_", p.stem)
             if m:
                 episode_nums.add(int(m.group(1)))
+        
+        self.logger.info(f"Scanned {file_count} files in {input_dir}, found {len(episode_nums)} unique episodes")
         return sorted(episode_nums)
 
     def parse_episode_by_number(self, episode_num: int):
