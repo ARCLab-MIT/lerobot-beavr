@@ -29,6 +29,12 @@ Examples:
 
     # Quick conversion with minimal config
     python -m lerobot.datasets.create_dataset.cli --repo-id "user/dataset" --input-dir "/data" --fps 30
+    
+    # Convert with parallel processing (faster for large datasets)
+    python -m lerobot.datasets.create_dataset.cli --config my_config.yaml --num-parallel-episodes 8 --num-image-threads 16
+    
+    # Disable parallel processing for debugging
+    python -m lerobot.datasets.create_dataset.cli --config my_config.yaml --no-parallel --debug
         """,
     )
 
@@ -43,6 +49,12 @@ Examples:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--test-mode", action="store_true", help="Process only first few episodes")
     parser.add_argument("--parser", type=str, choices=["csv_image", "image_pair"], help="Select parser type")
+    
+    # Parallel processing arguments
+    parser.add_argument("--num-parallel-episodes", type=int, help="Number of episodes to process in parallel (default: 4)")
+    parser.add_argument("--num-image-threads", type=int, help="Number of threads for batch image loading (default: 8)")
+    parser.add_argument("--image-batch-size", type=int, help="Number of images to load per batch (default: 32)")
+    parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing")
 
     args = parser.parse_args()
 
@@ -86,6 +98,14 @@ Examples:
             config.test_mode = True
         if args.parser:
             config.parser_type = args.parser
+        if args.no_parallel:
+            config.enable_parallel_processing = False
+        if args.num_parallel_episodes:
+            config.num_parallel_episodes = args.num_parallel_episodes
+        if args.num_image_threads:
+            config.num_image_loading_threads = args.num_image_threads
+        if args.image_batch_size:
+            config.image_loading_batch_size = args.image_batch_size
 
         # Run conversion
         converter = DatasetConverter(config)

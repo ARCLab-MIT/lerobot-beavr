@@ -7,8 +7,13 @@ This parser expects two flat subdirectories inside `config.input_dir`:
 Frames are paired by lexicographic filename order and grouped into a single multi-frame episode.
 Action images are converted to normalized [x, y] coordinates in [0, 1] by computing the centroid
 of pixels above a brightness threshold (default 200).
+
+Performance optimizations:
+  - Batch image loading using threading for I/O parallelization
+  - Memory-efficient streaming approach for large datasets
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +68,13 @@ class ImagePairParser(DataParser):
         self.action_subdir = getattr(config, "action_subdir", "action_ag3_byepisode")
         self.threshold = getattr(config, "action_threshold", 200)
         self.num_agents = getattr(config, "num_agents", 3)
+        # Optional fast image backend
+        self.image_backend = getattr(config, "image_backend", "pil")  # "opencv" or "pil"
+        try:
+            import cv2  # noqa: F401
+            self._opencv_available = True
+        except Exception:
+            self._opencv_available = False
 
     def get_episode_files(self) -> list[Path]:
         """Return a synthetic list with a single placeholder Path.
@@ -71,6 +83,42 @@ class ImagePairParser(DataParser):
         episode and return a list containing the input directory path to satisfy the API.
         """
         return [self.config.input_dir]
+
+    def list_episode_numbers(self) -> list[int]:
+        """Scan directories and return sorted unique episode numbers.
+
+        Episodes are identified by filenames containing the pattern 'ep_{number}_'.
+        """
+        input_dir = self.config.input_dir / self.input_subdir
+        if not input_dir.exists():
+            return []
+        episode_nums: set[int] = set()
+        import re
+        for p in input_dir.iterdir():
+            if not p.is_file():
+                continue
+            m = re.search(r"ep_(\d+)_", p.stem)
+            if m:
+                episode_nums.add(int(m.group(1)))
+        return sorted(episode_nums)
+
+    def parse_episode_by_number(self, episode_num: int):
+        """Parse and yield a single episode by its number.
+
+        Returns a generator yielding one episode_data dict or nothing if empty.
+        """
+        input_dir = self.config.input_dir / self.input_subdir
+        action_dir = self.config.input_dir / self.action_subdir
+        if not input_dir.exists() or not action_dir.exists():
+            return
+        # Collect files for this episode
+        input_files = sorted([p for p in input_dir.iterdir() if p.is_file() and f"ep_{episode_num}_" in p.stem])
+        action_files = sorted([p for p in action_dir.iterdir() if p.is_file() and f"ep_{episode_num}_" in p.stem])
+        if not input_files or not action_files:
+            return
+        episode_data = self._process_episode_files_streaming(input_files, action_files, episode_num)
+        if episode_data is not None:
+            yield episode_data
 
     def parse_episode(self, episode_file: Path):
         """Parse multiple episodes based on ep_ prefix in filenames.
@@ -128,8 +176,46 @@ class ImagePairParser(DataParser):
 
         return episode_groups
 
+    def _load_image_batch(self, paths: list[Path]) -> list[np.ndarray]:
+        """Load multiple images in parallel using threading.
+        
+        Args:
+            paths: List of image file paths to load
+            
+        Returns:
+            List of loaded images as numpy arrays
+        """
+        num_threads = getattr(self.config, 'num_image_loading_threads', 8)
+        
+        # For small batches, sequential loading is faster due to thread overhead
+        if len(paths) < 4:
+            return [load_image(p) for p in paths]
+        
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            images = list(executor.map(self._load_image_fast, paths))
+        return images
+
+    def _load_image_fast(self, path: Path) -> np.ndarray:
+        """Fast image loader: uses OpenCV when available/selected, else PIL fallback.
+        Returns HxWx3 uint8 array in RGB order.
+        """
+        if self.image_backend == "opencv" and self._opencv_available:
+            import cv2
+            # cv2.imread returns BGR; convert to RGB
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if img is None:
+                # Fallback to PIL loader
+                return load_image(path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return img
+        # Default PIL loader
+        return load_image(path)
+
     def _process_episode_files_streaming(self, input_files: list[Path], action_files: list[Path], episode_num: int) -> dict[str, list[Any]] | None:
-        """Process files for a single episode."""
+        """Process files for a single episode with batch image loading.
+        
+        Uses batch loading to parallelize I/O operations for better performance.
+        """
         episode_data: dict[str, list[Any]] = {
             "actions": [],
             "states": [],
@@ -142,41 +228,69 @@ class ImagePairParser(DataParser):
         img_key = self.config.image_keys[0] if self.config.image_keys else "observation.images.camera"
         episode_data["images"][img_key] = []
 
-        # Process each frame in this episode
-        for frame_idx in tqdm(range(min(len(input_files), len(action_files))), desc=f"Episode {episode_num}", unit="frame"):
-            input_path = input_files[frame_idx]
-            action_path = action_files[frame_idx]
-
+        num_frames = min(len(input_files), len(action_files))
+        
+        # Determine batch size for loading
+        # Larger batches = better parallelization but more memory usage
+        batch_size = getattr(self.config, 'image_loading_batch_size', 32)
+        enable_batch_loading = getattr(self.config, 'enable_parallel_processing', True)
+        
+        # Process frames in batches
+        for batch_start in tqdm(range(0, num_frames, batch_size), desc=f"Episode {episode_num}", unit="batch"):
+            batch_end = min(batch_start + batch_size, num_frames)
+            batch_indices = range(batch_start, batch_end)
+            
+            # Get file paths for this batch
+            input_paths = [input_files[i] for i in batch_indices]
+            action_paths = [action_files[i] for i in batch_indices]
+            
             try:
-                # Load observation image
-                obs_img = load_image(input_path)
+                # Load images in batch (parallelized I/O)
+                if enable_batch_loading:
+                    obs_images = self._load_image_batch(input_paths)
+                    action_images = self._load_image_batch(action_paths)
+                else:
+                    # Fallback to sequential loading if parallel processing is disabled
+                    obs_images = [load_image(p) for p in input_paths]
+                    action_images = [load_image(p) for p in action_paths]
+                
+                # Process each frame in the batch
+                for i, frame_idx in enumerate(batch_indices):
+                    try:
+                        obs_img = obs_images[i]
+                        action_img = action_images[i]
+                        
+                        # Extract action coordinates
+                        xy = _extract_xy_from_label_image(action_img, threshold=self.threshold)
+                        if xy is None:
+                            if self.config.debug:
+                                self.logger.warning(f"No white pixel found in action image: {action_paths[i]}. Skipping frame {frame_idx} in episode {episode_num}.")
+                            continue
 
-                # Load action image and extract coordinates
-                action_img = load_image(action_path)
-                xy = _extract_xy_from_label_image(action_img, threshold=self.threshold)
-                if xy is None:
-                    self.logger.warning(f"No white pixel found in action image: {action_path}. Skipping frame {frame_idx} in episode {episode_num}.")
-                    continue
+                        # For sequential processing within episode, assume sequential agent assignment
+                        agent_id = frame_idx % self.num_agents
+                        agent_indicator = np.zeros(3, dtype=np.float32)
+                        agent_indicator[agent_id] = 1.0
 
-                # For sequential processing within episode, assume sequential agent assignment
-                agent_id = frame_idx % self.num_agents
-                agent_indicator = np.zeros(3, dtype=np.float32)
-                agent_indicator[agent_id] = 1.0
+                        # Create 6D action vector with only one agent having non-zero values
+                        action_6d = np.zeros(6, dtype=np.float32)
+                        action_6d[agent_id * 2] = xy[0]
+                        action_6d[agent_id * 2 + 1] = xy[1]
 
-                # Create 6D action vector with only one agent having non-zero values
-                action_6d = np.zeros(6, dtype=np.float32)
-                action_6d[agent_id * 2] = xy[0]
-                action_6d[agent_id * 2 + 1] = xy[1]
+                        episode_data["images"][img_key].append(obs_img)
+                        episode_data["actions"].append(action_6d)
+                        episode_data["states"].append(agent_indicator)
+                        episode_data["timestamps"].append(float(frame_idx))  # Sequential within episode
+                        episode_data["tasks"].append(self.config.task_name)
+                        episode_data["task"].append(self.config.task_name)
 
-                episode_data["images"][img_key].append(obs_img)
-                episode_data["actions"].append(action_6d)
-                episode_data["states"].append(agent_indicator)
-                episode_data["timestamps"].append(float(frame_idx))  # Sequential within episode
-                episode_data["tasks"].append(self.config.task_name)
-                episode_data["task"].append(self.config.task_name)
-
+                    except Exception as e:
+                        self.logger.error(f"Error processing frame {frame_idx} in episode {episode_num}: {e}")
+                        if self.config.debug:
+                            raise
+                            
             except Exception as e:
-                self.logger.error(f"Error processing frame {frame_idx} in episode {episode_num}: {e}")
+                self.logger.error(f"Error loading batch starting at frame {batch_start} in episode {episode_num}: {e}")
                 if self.config.debug:
                     raise
 

@@ -1,7 +1,7 @@
 """Default configuration values for dataset conversion."""
 
 DEFAULT_CONFIG = {
-    "repo_id": "user/image2image_point_action",
+    "repo_id": "aposadasn/image2image_point_action",
     "fps": 1,
     "robot_type": "custom",
     "task_name": "Sensor tasking",

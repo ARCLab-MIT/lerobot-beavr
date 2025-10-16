@@ -43,6 +43,12 @@ class DatasetConfig:
     image_writer_processes: int = 0
     image_writer_threads: int = 4
     tolerance_s: float = 1e-4
+    
+    # Parallel processing options
+    num_parallel_episodes: int = 4  # Number of episodes to process in parallel (0 = sequential)
+    num_image_loading_threads: int = 8  # Number of threads for batch image loading within episodes
+    image_loading_batch_size: int = 32  # Number of images to load in a single batch
+    enable_parallel_processing: bool = True  # Master flag to enable/disable parallelization
 
     # Validation and debugging
     debug: bool = False
