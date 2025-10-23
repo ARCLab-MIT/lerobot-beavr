@@ -95,6 +95,8 @@ class DACTConfigA(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 100
+    window_size: int = 32
+    windows_per_optimizer_step: int = 4
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -144,7 +146,7 @@ class DACTConfigA(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-5
     optimizer_lr_backbone: float = 1e-5
     num_warmup_steps: int = 0
-    num_decay_steps: int = 100000
+    num_decay_steps: int = 40000
 
     # History encoder (Mamba-based) configuration
     history_d_state: int = 256

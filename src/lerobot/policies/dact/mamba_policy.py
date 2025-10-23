@@ -158,6 +158,7 @@ class Mamba2(nn.Module):
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 
         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (batch, D_in)
+
         d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
         z0, x0, z, xBC, dt = torch.split(  # noqa: N806
             zxbcdt,
@@ -174,13 +175,18 @@ class Mamba2(nn.Module):
                 xbc = xbc + self.conv1d.bias
             xbc = self.act(xbc).to(dtype=dtype)
         else:
-            xbc = causal_conv1d_update(
-                xBC,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
+            w = rearrange(self.conv1d.weight, "d 1 w -> d w")
+            bias = self.conv1d.bias
+            # Run kernel in fp32 to avoid dtype mismatch with AMP/bf16
+            with torch.amp.autocast('cuda', enabled=False):
+                xbc32 = causal_conv1d_update(
+                    xBC.float(),               # input as fp32
+                    conv_state.float(),        # state as fp32
+                    w.float(),                 # weights as fp32
+                    None if bias is None else bias.float(),
+                    self.activation,
+                )
+            xbc = xbc32.to(xBC.dtype)          # cast result back to computed dtype
 
         x, b_mat, c_mat = torch.split(xbc, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
         A = -torch.exp(self.A_log.float())  # (nheads,)  # noqa: N806
@@ -188,27 +194,29 @@ class Mamba2(nn.Module):
         # SSM step
         if selective_state_update is None:
             assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
-            dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))
+            with torch.amp.autocast('cuda', enabled=False):
+                dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))
 
-            # Clip dt to prevent explosion
-            dt = torch.clamp(dt, min=1e-6, max=1e3)
+                # Clip dt to prevent explosion
+                dt = torch.clamp(dt, min=1e-6, max=1e3)
 
-            d_a = torch.exp(dt * A)
+                d_a = torch.exp(dt * A)
 
-            # Clip d_a to prevent explosion
-            d_a = torch.clamp(d_a, min=1e-6, max=1e3)
+                # Clip d_a to prevent explosion
+                d_a = torch.clamp(d_a, min=1e-6, max=1e3)
 
-            x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            d_bx = torch.einsum("bh,bn,bhp->bhpn", dt, b_mat, x)
+                x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+                d_bx = torch.einsum("bh,bn,bhp->bhpn", dt, b_mat, x)
 
-            # Update SSM state with clipping
-            new_ssm_state = ssm_state * rearrange(d_a, "b h -> b h 1 1") + d_bx
-            new_ssm_state = torch.clamp(new_ssm_state, min=-1e3, max=1e3)
-            ssm_state = new_ssm_state
+                # Update SSM state with clipping
+                new_ssm_state = ssm_state * rearrange(d_a, "b h -> b h 1 1") + d_bx
+                new_ssm_state = torch.clamp(new_ssm_state, min=-1e3, max=1e3)
+                ssm_state = new_ssm_state
 
-            y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), c_mat)
-            y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
-            y = rearrange(y, "b h p -> b (h p)")
+                y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), c_mat.to(dtype))
+                y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+
+            y = rearrange(y, "b h p -> b (h p)").to(dtype)
             if not self.rmsnorm:
                 y = y * self.act(z)
 
@@ -280,43 +288,43 @@ class CrossModalAttention(nn.Module):
         attn_output, _ = self.multihead_attn(query, key, value)
         return self.norm(query + attn_output)
 
-class FrozenDinov2(nn.Module):
-    def __init__(self, config: DACTConfigA):
-        super().__init__()
-        self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
-        self.patch_size = config.patch_size
-        self.layer_index = config.layer_index
+# class FrozenDinov2(nn.Module):
+#     def __init__(self, config: DACTConfigA):
+#         super().__init__()
+#         self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+#         self.patch_size = config.patch_size
+#         self.layer_index = config.layer_index
 
-        for param in self.dino.parameters():
-            param.requires_grad_(False)
-        self.feature_hook = self._register_hook()
+#         for param in self.dino.parameters():
+#             param.requires_grad_(False)
+#         self.feature_hook = self._register_hook()
 
-    def _register_hook(self):
-        def hook(module, input, output):
-            self.intermediate_output = output
-        handle = self.dino.blocks[self.layer_index].register_forward_hook(hook)
-        return handle
+#     def _register_hook(self):
+#         def hook(module, input, output):
+#             self.intermediate_output = output
+#         handle = self.dino.blocks[self.layer_index].register_forward_hook(hook)
+#         return handle
 
-    def adaptive_resize(self, img, min_patches=8):
-        _, _, H, W = img.shape
-        min_size = self.patch_size * min_patches
-        scale = max(min_size / min(H, W), 1.0)
-        new_H = max(round(H * scale), min_size)
-        new_W = max(round(W * scale), min_size)
-        new_H = ((new_H + self.patch_size - 1) // self.patch_size) * self.patch_size
-        new_W = ((new_W + self.patch_size - 1) // self.patch_size) * self.patch_size
-        return TF.resize(img, (new_H, new_W), antialias=True)
+#     def adaptive_resize(self, img, min_patches=8):
+#         _, _, H, W = img.shape
+#         min_size = self.patch_size * min_patches
+#         scale = max(min_size / min(H, W), 1.0)
+#         new_H = max(round(H * scale), min_size)
+#         new_W = max(round(W * scale), min_size)
+#         new_H = ((new_H + self.patch_size - 1) // self.patch_size) * self.patch_size
+#         new_W = ((new_W + self.patch_size - 1) // self.patch_size) * self.patch_size
+#         return TF.resize(img, (new_H, new_W), antialias=True)
 
-    def forward(self, x):
-        x = self.adaptive_resize(x)
-        B, _, H, W = x.shape
+#     def forward(self, x):
+#         x = self.adaptive_resize(x)
+#         B, _, H, W = x.shape
 
-        _ = self.dino(x)
+#         _ = self.dino(x)
 
-        features = self.intermediate_output
+#         features = self.intermediate_output
 
-        H_patch = H // self.patch_size
-        W_patch = W // self.patch_size
-        features = features[:, 1:, :]
-        features = features.permute(0, 2, 1).view(B, -1, H_patch, W_patch)
-        return features  # [B, dim, H_patch, W_patch]
+#         H_patch = H // self.patch_size
+#         W_patch = W // self.patch_size
+#         features = features[:, 1:, :]
+#         features = features.permute(0, 2, 1).view(B, -1, H_patch, W_patch)
+#         return features  # [B, dim, H_patch, W_patch]

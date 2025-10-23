@@ -1,24 +1,3 @@
-#!/usr/bin/env python
-
-# Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Action Chunking Transformer Policy
-
-As per Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (https://huggingface.co/papers/2304.13705).
-The majority of changes here involve removing unused code, unifying naming, and adding helpful comments.
-"""
-
 from collections import deque
 from itertools import chain
 
@@ -40,18 +19,13 @@ from lerobot.policies.act.modeling_act import (
 from lerobot.policies.dact.configuration_dact_a import DACTConfigA
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
-from lerobot.policies.dact.mamba_policy import Mamba2, FrozenDinov2, CrossCameraAttention, CrossModalAttention
+from lerobot.policies.dact.mamba.mtil import Mamba2, CrossCameraAttention, CrossModalAttention
 from lerobot.policies.normalize import Normalize, Unnormalize
 from lerobot.policies.pretrained import PreTrainedPolicy
 
 HISTORY_TOKEN = "history_token"
-RAW_FEATURE_MAPS = "raw_feature_maps"
 
 class DACTPolicyA(PreTrainedPolicy):
-    """
-    Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
-    Hardware (paper: https://huggingface.co/papers/2304.13705, code: https://github.com/tonyzhaozh/act)
-    """
 
     config_class = DACTConfigA
     name = "dact_a"
@@ -93,21 +67,21 @@ class DACTPolicyA(PreTrainedPolicy):
         self.reset()
 
     def get_optim_params(self) -> dict:
-        # Separate backbone parameters (history encoder backbone) from other parameters
-        # to allow different learning rates for backbone vs other components
+        # Separate main model backbone from other parameters for different learning rates
+        # History backbone is frozen, so exclude it entirely
         return [
             {
                 "params": [
                     p
                     for n, p in self.named_parameters()
-                    if not n.startswith("history_encoder.hist_backbone") and p.requires_grad
+                    if not n.startswith("model.backbone") and p.requires_grad
                 ]
             },
             {
                 "params": [
                     p
                     for n, p in self.named_parameters()
-                    if n.startswith("history_encoder.hist_backbone") and p.requires_grad
+                    if n.startswith("model.backbone") and p.requires_grad
                 ],
                 "lr": self.config.optimizer_lr_backbone,
             },
@@ -119,11 +93,9 @@ class DACTPolicyA(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        self.history_cache = None
-        # Debug: track reset calls
-        if not hasattr(self, '_reset_count'):
-            self._reset_count = 0
-        self._reset_count += 1
+        # Separate caches to avoid type collisions:
+        self.mamba_cache = None       # tuple(conv_state, ssm_state) for inference .step()
+        self.hist_vec_cache = None    # Tensor (B, D) for TBPTT in training
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -150,6 +122,12 @@ class DACTPolicyA(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
+    def _ensure_hist_cache(self, B: int, device: torch.device, dtype: torch.dtype):
+        if getattr(self, "hist_vec_cache", None) is None \
+        or self.hist_vec_cache.shape[0] != B \
+        or self.hist_vec_cache.device != device \
+        or self.hist_vec_cache.dtype != dtype:
+            self.hist_vec_cache = torch.zeros(B, self.config.dim_model, device=device, dtype=dtype)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -166,22 +144,21 @@ class DACTPolicyA(PreTrainedPolicy):
 
         # Check if cache batch size matches current batch size, reinitialize if needed
         current_batch_size = x_t.shape[0]
-        if self.history_cache is None:
-            self.history_cache = self.history_encoder.init_cache(current_batch_size)
+        if self.mamba_cache is None:
+            self.mamba_cache = self.history_encoder.init_cache(current_batch_size, x_t.dtype)
         else:
             # Check if cache batch size matches current batch size
-            cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
+            cache_batch_size = self.mamba_cache[0].shape[0] if self.mamba_cache[0] is not None else 0
             if cache_batch_size != current_batch_size:
-                self.history_cache = self.history_encoder.init_cache(current_batch_size)
+                self.mamba_cache = self.history_encoder.init_cache(current_batch_size, x_t.dtype)
 
         # Ensure cache is on the same device as input
-        if hasattr(self.history_cache[0], 'device'):
+        if hasattr(self.mamba_cache[0], 'device'):
             target_device = x_t.device
-            if self.history_cache[0].device != target_device:
-                self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
-                                        for cache in self.history_cache)
-
-            h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
+            if self.mamba_cache[0].device != target_device:
+                self.mamba_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
+                                         for cache in self.mamba_cache)
+            h_t, self.mamba_cache = self.history_encoder.step(x_t, self.mamba_cache)
 
         batch[HISTORY_TOKEN] = h_t
 
@@ -190,37 +167,104 @@ class DACTPolicyA(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        import time
+        import os
+        timing_dict = {}
+        
+        # Time the entire forward pass
+        total_forward_start = time.perf_counter()
+        
+        # Time batch preprocessing
+        preprocessing_start = time.perf_counter()
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        preprocessing_time = (time.perf_counter() - preprocessing_start) * 1000
+        timing_dict['preprocessing_ms'] = preprocessing_time
 
-        # Compute/update history token h_t
-        x_t = self.history_encoder.fuse_obs_to_history_vec(batch)
-
-        # Check if cache batch size matches current batch size, reinitialize if needed
-        current_batch_size = x_t.shape[0]
-        if self.history_cache is None:
-            self.history_cache = self.history_encoder.init_cache(current_batch_size)
+        # ----- TBPTT stateful history -----
+        # 1) make sure we have a cache shaped to (B, D)
+        cache_start = time.perf_counter()
+        device = next(self.parameters()).device
+        if self.config.image_features:
+            B = batch[OBS_IMAGES][0].shape[0]
+            dtype = batch[OBS_IMAGES][0].dtype
         else:
-            # Check if cache batch size matches current batch size
-            cache_batch_size = self.history_cache[0].shape[0] if self.history_cache[0] is not None else 0
-            if cache_batch_size != current_batch_size:
-                self.history_cache = self.history_encoder.init_cache(current_batch_size)
+            B = batch[OBS_STATE].shape[0]
+            dtype = batch[OBS_STATE].dtype
 
-        # Ensure cache is on the same device as input
-        if hasattr(self.history_cache[0], 'device'):
-            target_device = x_t.device
-            if self.history_cache[0].device != target_device:
-                self.history_cache = tuple(cache.to(target_device) if hasattr(cache, 'to') else cache
-                                        for cache in self.history_cache)
-            
-            # Step the history encoder
-            h_t, self.history_cache = self.history_encoder.step(x_t, self.history_cache)
+        self._ensure_hist_cache(B, device, dtype)  # ensures self.hist_vec_cache
 
-        batch[HISTORY_TOKEN] = h_t
+        # 2) DETACH previous hidden (truncation)
+        h_prev = self.hist_vec_cache.detach()
+        cache_time = (time.perf_counter() - cache_start) * 1000
+        timing_dict['cache_ops_ms'] = cache_time
 
+        # 3) Run encoder over the window with prefix-priming
+        history_start = time.perf_counter()
+        # Optional precise profiling
+        if torch.cuda.is_available() and os.getenv("LEROBOT_TIMING_SYNC") == "1":
+            torch.cuda.synchronize()
+        h_seq = self.history_encoder.forward(batch, h_prev=h_prev)  # (B, L, D)
+        if torch.cuda.is_available() and os.getenv("LEROBOT_TIMING_SYNC") == "1":
+            torch.cuda.synchronize()
+        history_time = (time.perf_counter() - history_start) * 1000
+        timing_dict['history_ms'] = history_time
+
+        # 4) Take the last valid history vector for this window
+        postprocess_start = time.perf_counter()
+        # In-place, zero-alloc update of history cache and select() views
+        self._ensure_hist_cache(B, device, dtype)
+        # Keep gradients for TBPTT - only detach the cache tensor itself, not the source
+        h_last = h_seq.select(1, -1)  # (B, D) view
+        self.hist_vec_cache.copy_(h_last.detach())  # Copy detached version to cache
+
+        # 5) If any streams ended in this window, reset their cache
+        #    Prefer the explicit ended mask if present; otherwise derive from valid_mask.
+        if "ended_mask" in batch:
+            ended = batch["ended_mask"]                    # (B,)
+        elif "valid_mask" in batch:
+            ended = ~batch["valid_mask"][:, -1]            # (B,)
+        else:
+            ended = None
+
+        if ended is not None and ended.any():
+            # zero them in-place on the cache tensor
+            self.hist_vec_cache[ended] = 0
+
+        # 6) Update cache for next window  
+        # Use the original h_last (with gradients) for TBPTT, cache is just for storage
+        # ----------------------------------
+
+        # The rest stays the same, except use the TBPTT history token:
+        batch[HISTORY_TOKEN] = h_last
+
+        # Only last frame per cam/low-dim goes to ACT for this window (as you already do)
+        if self.config.image_features:
+            # Use view-based selection and set channels_last only after selecting last frame
+            imgs_last = [imgs.select(1, -1).contiguous(memory_format=torch.channels_last) for imgs in batch[OBS_IMAGES]]
+            batch[OBS_IMAGES] = imgs_last
+        if OBS_STATE in batch and batch[OBS_STATE].dim() > 2:
+            batch[OBS_STATE] = batch[OBS_STATE].select(1, -1)
+        if ACTION in batch and batch[ACTION].dim() > 3:
+            batch[ACTION] = batch[ACTION].select(1, -1)
+        if "action_is_pad" in batch and batch["action_is_pad"].dim() > 2:
+            batch["action_is_pad"] = batch["action_is_pad"].select(1, -1)
+        postprocess_time = (time.perf_counter() - postprocess_start) * 1000
+        timing_dict['postprocess_ms'] = postprocess_time
+
+        # Time the main model forward pass
+        model_start = time.perf_counter()
+        if torch.cuda.is_available() and os.getenv("LEROBOT_TIMING_SYNC") == "1":
+            torch.cuda.synchronize()
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        if torch.cuda.is_available() and os.getenv("LEROBOT_TIMING_SYNC") == "1":
+            torch.cuda.synchronize()
+        model_time = (time.perf_counter() - model_start) * 1000
+        timing_dict['model_forward_ms'] = model_time
 
+        # Time loss computation
+        loss_start = time.perf_counter()
         # Compute L1 loss only over non-padded actions
         # Mask shape: (B, chunk_size, 1) where True = valid (not padded)
         action_mask = ~batch["action_is_pad"].unsqueeze(-1)
@@ -241,6 +285,16 @@ class DACTPolicyA(PreTrainedPolicy):
             loss = l1_loss * self.config.l1_weight + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
+
+        loss_time = (time.perf_counter() - loss_start) * 1000
+        timing_dict['loss_computation_ms'] = loss_time
+        
+        # Calculate total forward time and add all timing info
+        total_forward_time = (time.perf_counter() - total_forward_start) * 1000
+        timing_dict['total_forward_ms'] = total_forward_time
+        
+        # Add all timing info to loss_dict
+        loss_dict.update(timing_dict)
 
         return loss, loss_dict
 
@@ -324,6 +378,7 @@ class DACT(nn.Module):
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            self.backbone = self.backbone.to(memory_format=torch.channels_last)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -345,6 +400,8 @@ class DACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
+            self.encoder_img_feat_input_proj = self.encoder_img_feat_input_proj.to(memory_format=torch.channels_last)
+
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -418,6 +475,7 @@ class DACT(nn.Module):
                 vae_encoder_input = [cls_embed, robot_state_embed, hist_embed, action_embed]  # (B, S+3, D)
             else:
                 vae_encoder_input = [cls_embed, hist_embed, action_embed]
+
             vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
 
             # Prepare fixed positional embedding.
@@ -563,22 +621,28 @@ class HistoryEncoder(nn.Module):
             self.hist_backbone = IntermediateLayerGetter(history_backbone_model, return_layers={"layer4": "feature_map"})
             # Expose backbone output channels for consumers
             self.hist_backbone_out_channels = history_backbone_model.fc.in_features
-        # self.hist_backbone = FrozenDinov2(config)
-        self.in_dim = config.dim_model * self.num_cameras
+            self.hist_backbone = self.hist_backbone.to(memory_format=torch.channels_last)
+            
+            # Freeze the history backbone parameters
+            for param in self.hist_backbone.parameters():
+                param.requires_grad = False
+
         self.cross_camera_attn = self.cross_cam_attn = CrossCameraAttention(config)
         self.cross_modal_attn = CrossModalAttention(config)
 
-        self.encoder_history_input_proj = nn.Linear(self.in_dim, config.dim_model)
+        self.encoder_history_input_proj = nn.Linear(config.dim_model, config.dim_model)
 
-    def init_cache(self, batch_size: int) -> tuple[Tensor, Tensor]:
-        return self.mamba.allocate_inference_cache(batch_size=batch_size, max_seqlen=1, dtype=None)
+    @torch.no_grad()
+    def init_cache(self, batch_size: int, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        return self.mamba.allocate_inference_cache(batch_size=batch_size, max_seqlen=1, dtype=dtype)
 
+    @torch.no_grad()
     def step(
         self,
         x_t: Tensor, # (B, D)
         cache: tuple[Tensor, Tensor],
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        """Run one recurrent step.
+        """Run one recurrent step (inference only).
 
         Args:
             x_t: (B, D)
@@ -586,59 +650,131 @@ class HistoryEncoder(nn.Module):
         Returns:
             h_t: (B, D) and updated cache
         """
-        # conv_state is a (B, D_conv) tensor
-        # ssm_state is a (B, nheads, headdim, d_state) tensor
-        # These tensors are used to store the state of the Mamba2 block
         conv_state, ssm_state = cache
-        # Treat prior cache as constants
-        conv_state = conv_state.detach()
-        ssm_state = ssm_state.detach()
-
         h_t, new_conv, new_ssm = self.mamba.step(x_t.unsqueeze(1), conv_state, ssm_state)
+        return h_t.squeeze(1), (new_conv, new_ssm)
 
-        return h_t, (new_conv.detach(), new_ssm.detach())
-
-    def forward(self, x_seq: Tensor) -> Tensor:
-        """Process a full sequence.
+    def forward(self, batch_seq: dict[str, Tensor], h_prev: Tensor | None = None) -> Tensor:
+        """Process a full sequence using fused Mamba2 forward (training).
 
         Args:
-            x_seq: (B, D)
+            x_seq: (B, L, D) sequence of history vectors
         Returns:
-            h_seq: (B, D)
+            h_seq: (B, L, D) processed history features
         """
-        return self.mamba(x_seq)
+        # Use fused forward path for efficiency during training
+        x_seq = self.fuse_obs_sequence_to_history(batch_seq) # (B, L, D)
+
+        if h_prev is not None:
+            if h_prev.dtype != x_seq.dtype:
+                h_prev = h_prev.to(x_seq.dtype)
+            if h_prev.device != x_seq.device:
+                h_prev = h_prev.to(x_seq.device)
+        
+            x_seq = torch.cat([h_prev.unsqueeze(1), x_seq], dim=1)
+            h_seq = self.mamba(x_seq) # (B, L+1, D)
+            h_seq = h_seq[:, 1:, :] # (B, L, D)
+        
+        else:
+            h_seq = self.mamba(x_seq) # (B, L, D)            
+        
+        return h_seq
+
+    def fuse_obs_sequence_to_history(self, batch: dict[str, Tensor]) -> Tensor:
+        """Fuse a sequence of observations into history vectors (B, L, D).
+        
+        Processes all cameras and timesteps in a single batched backbone forward pass (N_cam*B*L).
+        Uses channels_last memory format for cuDNN optimization.
+        
+        Args:
+            batch: dict with OBS_IMAGES [(B, L, C, H, W), ...] and optionally OBS_STATE (B, L, D_state)
+        Returns:
+            x_seq: (B, L, D) sequence of fused history vectors
+        """
+        # Extract dimensions
+        first_img_key = list(batch[OBS_IMAGES].keys())[0] if isinstance(batch[OBS_IMAGES], dict) else 0
+        first_img = batch[OBS_IMAGES][first_img_key] if isinstance(batch[OBS_IMAGES], dict) else batch[OBS_IMAGES][0]
+        B, L = first_img.shape[:2]
+        
+        # Batch all cameras together for single backbone forward pass
+        # Stack cameras: list of (B, L, C, H, W) → (N_cam, B, L, C, H, W)
+        img_stack = torch.stack(batch[OBS_IMAGES], dim=0)  # (N_cam, B, L, C, H, W)
+        N_cam = img_stack.shape[0]
+        C, H, W = img_stack.shape[3:]
+        
+        # Flatten to (N_cam*B*L, C, H, W) and convert to channels_last for cuDNN fast path
+        img_batch = img_stack.reshape(N_cam * B * L, C, H, W)
+        # If frames are uint8 (0–255), convert before resizing
+        if img_batch.dtype == torch.uint8:
+            img_batch = img_batch.float().div_(255)
+
+        # (Works fine under AMP)
+        img_batch = torch.nn.functional.interpolate(
+            img_batch, size=(224, 224), mode="bilinear", align_corners=False, antialias=True
+            ).contiguous(memory_format=torch.channels_last)
+        
+        # Single backbone forward pass for all cameras
+        raw = self.hist_backbone(img_batch)  # dict with key "feature_map"
+        raw_img_features = raw["feature_map"]
+        img_features = self.spatial_adapter(raw_img_features)  # (N_cam*B*L, D)
+        
+        # Reshape to (N_cam, B, L, D) then split per camera
+        D = img_features.shape[-1]
+        img_features = img_features.view(N_cam, B, L, D)
+        features = [img_features[i] for i in range(N_cam)]  # list of (B, L, D)
+        
+        # Stack cameras then cross-camera MHA
+        per_cam = features               # list of (B, L, D)
+        cam_tokens = torch.stack(per_cam, dim=2)  # (B, L, C, D)
+        B, L, C, D = cam_tokens.shape
+        x = cam_tokens.reshape(B*L, C, D)                 # (BL, C, D) cameras as sequence
+        x = self.cross_camera_attn(x, x, x)               # residual + norm; (BL, C, D)
+        x = x.mean(dim=1).reshape(B, L, D)                # pool cameras
+        cam_features_proj = self.encoder_history_input_proj(x)  # (B, L, D)
+        
+        if self.config.robot_state_feature and OBS_STATE in batch:
+            k = v = self.cross_modal_attn.proj_lowdim(batch[OBS_STATE])  # (B, L, D)
+            q = cam_features_proj                                        # (B, L, D)
+            x_seq = self.cross_modal_attn(q, k, v)                       # (B, L, D)
+        else:
+            x_seq = cam_features_proj
+        
+        return x_seq
 
     def fuse_obs_to_history_vec(self, batch: dict[str, Tensor]) -> Tensor:
         """Fuse per-step observation into a rich vector x_t for the HistoryEncoder.
         """
-        # 1
-        features = []
+        # ---- per-step visual features for each camera -> (B, D) ----
+        per_cam_feats: list[Tensor] = []
         for img in batch[OBS_IMAGES]:
-            raw = self.hist_backbone(img)  # dict with key "feature_map"
-            raw_img_features = raw["feature_map"]
-            img_features = self.spatial_adapter(raw_img_features)
-            features.append(img_features)
+            raw = self.hist_backbone(img)                 # {"feature_map": ...}
+            fmap = raw["feature_map"]                     # (B, Cb, H', W')
+            feat = self.spatial_adapter(fmap)             # (B, D)
+            per_cam_feats.append(feat)
 
-        cam_features = torch.cat(features, dim=1)
+        # Cross-camera attention exactly like the sequence path but with L=1
+        # Build (B, 1, C, D) then reshape to (B, C, D) and attend across C
+        C = len(per_cam_feats)
+        cam_tokens = torch.stack([f.unsqueeze(1) for f in per_cam_feats], dim=2)  # (B, 1, C, D)
+        B = cam_tokens.shape[0]
+        D = cam_tokens.shape[-1]
+        x = cam_tokens.reshape(B, C, D)                     # (B, C, D)
+        # MultiheadAttention usually expects (L, N, E) unless batch_first=True inside CrossCameraAttention.
+        # CrossCameraAttention in your sequence path was called with (BL, C, D); to attend across cameras,
+        # pass (C, B, D) so L=C (cameras), N=B.
+        x = self.cross_camera_attn(x, x, x)                  # (B, C, D)
+        x = x.mean(dim=1)                                    # (B, D)
+        cam_features_proj = self.encoder_history_input_proj(x)  # (B, D)
 
-        # If there are multiple cameras, we need to pool them together
-        if self.num_cameras > 1:
-            cam_features = self.cross_camera_attn(
-                cam_features.unsqueeze(1),
-                cam_features.unsqueeze(1),
-                cam_features.unsqueeze(1),
-            ).squeeze(1)
-
-        # 2
+        # ---- cross-modal fusion (project low-dim state first!) ----
         if self.config.robot_state_feature:
-            low_dim_features = batch[OBS_STATE].unsqueeze(1)  # (B, 1, D)
-            cam_features_proj = self.encoder_history_input_proj(cam_features) # (B, D)
-            fused_features = self.cross_modal_attn(
-                query=cam_features_proj.unsqueeze(1),
-                key=low_dim_features,
-                value=low_dim_features,
-            ).squeeze(1)
+            low = self.cross_modal_attn.proj_lowdim(batch[OBS_STATE])  # (B, D)
+            fused = self.cross_modal_attn(
+                query=cam_features_proj.unsqueeze(1),                  # (B, 1, D)
+                key=low.unsqueeze(1),                                  # (B, 1, D)
+                value=low.unsqueeze(1),                                # (B, 1, D)
+            ).squeeze(1)                                               # (B, D)
+        else:
+            fused = cam_features_proj
 
-        x_t = fused_features # (B, D)
-
-        return x_t
+        return fused  # (B, D)

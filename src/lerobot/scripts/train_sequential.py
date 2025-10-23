@@ -1,22 +1,31 @@
-#!/usr/bin/env python
-
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-
 import logging
+import multiprocessing
+import os
 import random
 import time
 from collections import deque
 from contextlib import nullcontext
 from typing import Any
 
+# Suppress FFmpeg debug messages from torchcodec before any imports
+os.environ["AV_LOG_LEVEL"] = "error"
+os.environ["FFMPEG_LOGLEVEL"] = "error"
+
+# Set FFmpeg logging to error level before importing av
+import av.logging
+av.logging.set_level(av.logging.ERROR)
+
 import torch
+import av
+
+# Also try to suppress any remaining FFmpeg messages at C level
+try:
+    import ctypes
+    # Try to load avutil and set log level if possible
+    avutil = ctypes.CDLL("libavutil.so.58")  # Adjust version as needed
+    avutil.av_log_set_level(8)  # AV_LOG_ERROR = 8
+except:
+    pass  # If this fails, continue anyway
 from termcolor import colored
 from torch.amp import GradScaler
 from torch.optim import Optimizer
@@ -47,163 +56,166 @@ from lerobot.utils.utils import (
 from lerobot.utils.wandb_utils import WandBLogger
 
 
-class LockstepEpisodeIterator:
+def sample_episode_batch(episode_data_index: dict[str, torch.Tensor], batch_size: int, shuffle: bool = True) -> list[int]:
     """
-    Advances B episode streams in lockstep, yielding per-step frame indices and reset_mask.
-
-    Maintains per-stream pointers (from, to, cur). When a stream reaches its end, it is reset by
-    pulling the next episode index from the queue.
+    Sample a batch of episode indices.
+    
+    Args:
+        episode_data_index: Dictionary with 'from' and 'to' tensors indicating episode boundaries
+        batch_size: Number of episodes to sample
+        shuffle: Whether to shuffle episode order
+        
+    Returns:
+        List of episode indices
     """
+    num_episodes = len(episode_data_index["from"])
+    if shuffle:
+        return random.sample(range(num_episodes), min(batch_size, num_episodes))
+    else:
+        # Sequential sampling with wraparound
+        return [i % num_episodes for i in range(batch_size)]
 
-    def __init__(self, episode_data_index: dict[str, torch.Tensor], b: int):
-        self.from_list = episode_data_index["from"].tolist()
-        self.to_list = episode_data_index["to"].tolist()
-        self.num_episodes = len(self.from_list)
-        self.B = b
 
-        # Queue of remaining episode ids
-        self.remaining = deque(range(self.num_episodes))
+def get_episode_frames(episode_data_index: dict[str, torch.Tensor], episode_idx: int) -> tuple[int, int, int]:
+    """
+    Get frame range for an episode.
+    
+    Returns:
+        (start_frame, end_frame, episode_length)
+    """
+    start = episode_data_index["from"][episode_idx].item()
+    end = episode_data_index["to"][episode_idx].item()
+    return start, end, end - start
 
-        # Per-stream episode id and pointers
-        self.stream_ep = [-1] * b
-        self.ptr_from = [0] * b
-        self.ptr_to = [0] * b
-        self.ptr_cur = [0] * b
-        # Per-stream random offset within episode (for decorrelating initial steps)
-        self.stream_offset = [0] * b
 
-        # Initialize streams
-        for i in range(b):
-            if not self.remaining:
-                break
-            ep = self.remaining.popleft()
-            self.stream_ep[i] = ep
-            self.ptr_from[i] = self.from_list[ep]
-            self.ptr_to[i] = self.to_list[ep]
-            # Choose random offset within episode bounds
-            episode_length = self.ptr_to[i] - self.ptr_from[i]
-            if episode_length > 1:
-                self.stream_offset[i] = random.randint(0, episode_length - 1)
+class FrameIndexDataset(torch.utils.data.Dataset):
+    """
+    Wrapper dataset that fetches frames by dynamically set indices.
+    Avoids recreating DataLoader and workers for each window.
+    """
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        self.frame_indices: list[int] = []
+    
+    def set_indices(self, indices: list[int]):
+        """Set the frame indices to fetch for the next iteration."""
+        self.frame_indices = indices
+    
+    def __len__(self):
+        return len(self.frame_indices)
+    
+    def __getitem__(self, idx):
+        return self.base_dataset[self.frame_indices[idx]]
+
+
+def _gather_windowed_batch_dataloader(
+    frame_dataset: FrameIndexDataset,
+    dataloader: torch.utils.data.DataLoader,
+    episode_info: list,
+    window_size: int,
+    window_start: int,
+):
+    """
+    Gather windowed batch using a persistent DataLoader.
+    
+    Notes:
+        - Reuses the same DataLoader and workers across windows
+        - Preserves clamping-at-end behavior to keep labels stable
+        - Builds masks identical to the original helper
+    """
+    B = len(episode_info)
+    K = window_size
+
+    # Build flat list of frame indices in (b, t) order
+    frame_indices: list[int] = []
+    valid = torch.zeros(B, K, dtype=torch.bool)
+    for b, (start_frame, end_frame, ep_length) in enumerate(episode_info):
+        for t in range(K):
+            actual_t = window_start + t
+            is_valid = actual_t < ep_length
+            valid[b, t] = is_valid
+            if is_valid:
+                frame_idx = start_frame + actual_t
             else:
-                self.stream_offset[i] = 0
-            self.ptr_cur[i] = self.ptr_from[i] + self.stream_offset[i]
+                frame_idx = end_frame - 1
+            frame_indices.append(frame_idx)
 
-    def _reload_stream(self, i: int) -> bool:
-        # If exhausted, wrap-around by refilling the queue
-        if not self.remaining:
-            self.remaining = deque(range(self.num_episodes))
-        ep = self.remaining.popleft()
-        self.stream_ep[i] = ep
-        self.ptr_from[i] = self.from_list[ep]
-        self.ptr_to[i] = self.to_list[ep]
-        # Choose random offset within episode bounds for new episode
-        episode_length = self.ptr_to[i] - self.ptr_from[i]
-        if episode_length > 1:
-            self.stream_offset[i] = random.randint(0, episode_length - 1)
+    # Set indices in the persistent dataset wrapper
+    frame_dataset.set_indices(frame_indices)
+    
+    # Fetch single batch from persistent DataLoader
+    flat_batch = next(iter(dataloader))
+
+    out: dict[str, torch.Tensor] = {}
+
+    # Reshape tensors from (B*K, ...) -> (B, K, ...)
+    for k, v in flat_batch.items():
+        if not torch.is_tensor(v):
+            continue
+        out[k] = v.reshape(B, K, *v.shape[1:])
+
+    # Add window metadata
+    out["window_start"] = torch.tensor([window_start] * B, dtype=torch.long)
+    out["window_size"] = torch.tensor([K] * B, dtype=torch.long)
+
+    # Ensure (B, K, S) action_is_pad semantics for the last step
+    S = None
+    if "action_is_pad" in out and out["action_is_pad"].ndim == 3:
+        pad = out["action_is_pad"].clone()
+        S = pad.shape[-1]
+    else:
+        if "action" in out and out["action"].ndim == 4:
+            S = out["action"].shape[2]
         else:
-            self.stream_offset[i] = 0
-        self.ptr_cur[i] = self.ptr_from[i] + self.stream_offset[i]
-        return True
+            raise RuntimeError("Need (B,K,S,...) ACTION or (B,K,S) action_is_pad to construct masks.")
+        pad = torch.zeros(B, K, S, dtype=torch.bool)
 
-    def __iter__(self):
-        return self
+    invalid_last = (~valid[:, -1]).unsqueeze(-1)
+    pad[:, -1, :] = torch.where(invalid_last, torch.ones_like(pad[:, -1, :], dtype=pad.dtype), pad[:, -1, :])
 
-    def __next__(self) -> tuple[list[int], torch.Tensor]:
-        frame_indices: list[int] = []
-        reset_mask = torch.zeros(self.B, dtype=torch.bool)
+    out["action_is_pad"] = pad
+    out["valid_mask"] = valid
+    out["alive_mask"] = valid.any(dim=1)
+    out["ended_mask"] = ~valid[:, -1]
 
-        # Determine next frames; always keep B active via wrap-around
-        for i in range(self.B):
-            # If at stream's starting position (i.e., just started or just reloaded), signal reset for this stream
-            if self.ptr_cur[i] == self.ptr_from[i] + self.stream_offset[i]:
-                reset_mask[i] = True
-            frame_indices.append(self.ptr_cur[i])
-
-        # Advance pointers and handle boundaries for next call
-        for i in range(self.B):
-            self.ptr_cur[i] += 1
-            if self.ptr_cur[i] >= self.ptr_to[i]:
-                # reached end of episode; reload next (wrap if needed)
-                self._reload_stream(i)
-
-        return frame_indices, reset_mask
+    return out
 
 
-def _gather_batch(dataset, frame_indices: list[int]) -> dict:
-    # Note: -1 indices denote inactive streams; skip them to keep tight B across active streams only.
-    # We will still build a dense batch of size B by repeating the last valid frame if needed.
-    items = []
-    last_valid = None
-    for idx in frame_indices:
-        if idx >= 0:
-            item = dataset[idx]
-            last_valid = item
-            items.append(item)
-        else:
-            # Fallback to last valid to keep shapes; action_is_pad should mask it out downstream
-            if last_valid is None:
-                # If nothing valid yet, duplicate a dummy first item (index 0)
-                last_valid = dataset[0]
-            items.append(last_valid)
-
-    # Collate dict of tensors; dataset returns tensors already
-    batch = {}
-    for k in items[0].keys():
-        v_list = [it[k] for it in items]
-        if isinstance(v_list[0], torch.Tensor):
-            batch[k] = torch.stack(v_list, dim=0)
-        else:
-            batch[k] = v_list
-    return batch
-
-def _splice_rows(cache, fresh, mask):
-    if cache is None or fresh is None:
-        return cache
-    if isinstance(cache, (tuple, list)):
-        return type(cache)(_splice_rows(c,f,mask) for c,f in zip(cache, fresh, strict=False))
-    if torch.is_tensor(cache):
-        m = mask.view(cache.shape[0], *([1] * (cache.dim()-1)))
-        return torch.where(m, fresh.to(cache.device, cache.dtype), cache)
-    return cache
-
-
-def _masked_history_reset(policy, reset_mask, fresh_template=None):
-    if not hasattr(policy, "history_encoder"):
-        if reset_mask.any():
-            policy.reset()
-        return
-    if (
-        getattr(policy, "history_cache", None) is None
-        or not reset_mask.any()
-    ):
-        return
-    # Helper function to move tensors to device
-    def _to_device(x):
-        if isinstance(x, (tuple, list)):
-            return type(x)(_to_device(t) for t in x)
-        return x.to(reset_mask.device) if torch.is_tensor(x) else x
-
-    if fresh_template is None:
-        fresh_template = policy.history_encoder.init_cache(reset_mask.shape[0])
-        fresh_template = _to_device(fresh_template)
-
-    # Check if cache batch size matches reset_mask batch size, reinitialize if needed
-    current_batch_size = reset_mask.shape[0]
-    cache_batch_size = policy.history_cache[0].shape[0] if policy.history_cache[0] is not None else 0
-    if cache_batch_size != current_batch_size:
-        policy.history_cache = policy.history_encoder.init_cache(current_batch_size)
-        policy.history_cache = _to_device(policy.history_cache)
-
-    policy.history_cache = _splice_rows(policy.history_cache, fresh_template, reset_mask)
-
-
-def _accumulate_step(policy: PreTrainedPolicy, batch: Any, grad_scaler: GradScaler, use_amp: bool) -> tuple[float, dict]:
+def _accumulate_windowed_step(policy: PreTrainedPolicy, batch: Any, grad_scaler: GradScaler, use_amp: bool) -> tuple[float, dict]:
+    """
+    Accumulate gradients for a windowed sequence batch.
+    
+    Args:
+        policy: The policy model
+        batch: Windowed batch of shape (B, K, ...)
+        grad_scaler: Gradient scaler for mixed precision
+        use_amp: Whether to use automatic mixed precision
+    
+    Returns:
+        (loss_value, loss_dict)
+    """
     device = get_device_from_parameters(policy)
     policy.train()
+    
+    # Detailed timing for each step
+    step_timings = {}
+    
+    # Forward pass timing
+    forward_start = time.perf_counter()
     with torch.autocast(device_type=device.type) if use_amp else nullcontext():
         loss, loss_dict = policy.forward(batch)
-        # Loss is already normalized in the model, no need to scale here
+    forward_time = (time.perf_counter() - forward_start) * 1000  # ms
+    step_timings['forward_ms'] = forward_time
+    
+    # Backward pass timing
+    backward_start = time.perf_counter()
     grad_scaler.scale(loss).backward()
+    backward_time = (time.perf_counter() - backward_start) * 1000  # ms
+    step_timings['backward_ms'] = backward_time
+    
+    # Add timing info to loss_dict for logging
+    loss_dict.update(step_timings)
+    
     return float(loss.item()), loss_dict
 
 
@@ -234,6 +246,18 @@ def _optimizer_step(
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
     logging.info(cfg.to_dict())
+    
+    # TBPTT Configuration
+    logging.info(f"TBPTT Configuration: window_size={cfg.policy.window_size}, windows_per_step={cfg.policy.windows_per_optimizer_step}")
+    
+    # DataLoader configuration
+    num_workers = cfg.num_workers
+    if num_workers > 0:
+        logging.info(f"DataLoader will use {num_workers} workers with spawn context and persistent_workers=True")
+        logging.info("Note: First window may be slow while workers initialize video decoders")
+
+        # Ensure FFmpeg logging is suppressed in worker processes too
+        # The environment variables set at module level should be inherited
 
     if cfg.wandb.enable and cfg.wandb.project:
         wandb_logger = WandBLogger(cfg)
@@ -251,6 +275,27 @@ def train(cfg: TrainPipelineConfig):
     logging.info("Creating dataset")
     dataset = make_dataset(cfg)
 
+    # Create persistent DataLoader for efficient frame fetching across windows
+    # This avoids recreating workers and FFmpeg decoders for each window
+    frame_dataset = FrameIndexDataset(dataset)
+    
+    # Use spawn context to avoid video decoder fork issues
+    mp_context = multiprocessing.get_context('spawn') if num_workers > 0 else None
+    
+    persistent_dataloader = torch.utils.data.DataLoader(
+        frame_dataset,
+        batch_size=cfg.batch_size * cfg.policy.window_size,  # Max batch size (B * K frames)
+        shuffle=False,
+        num_workers=max(int(num_workers), 0),
+        pin_memory=device.type == "cuda",
+        drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
+        multiprocessing_context=mp_context,
+        prefetch_factor=6 if num_workers > 0 else 2,  # Prefetch more batches
+    )
+    
+    logging.info(f"Created persistent DataLoader with {num_workers} workers (reuses decoders across windows)")
+
     # Optional eval env
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None:
@@ -265,6 +310,7 @@ def train(cfg: TrainPipelineConfig):
     grad_scaler = GradScaler(enabled=cfg.policy.use_amp)
 
     step = 0
+    total_optimizer_steps = 0  # Track total optimizer steps for logging
     if cfg.resume:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
@@ -280,10 +326,14 @@ def train(cfg: TrainPipelineConfig):
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # Sequential training batch size
+    # Sequential training batch size (B episodes processed in parallel)
     batch_size = cfg.batch_size
-
-    iterator = LockstepEpisodeIterator(dataset.episode_data_index, b=batch_size)
+    num_episodes = dataset.num_episodes
+    
+    # Create episode index pool for sampling
+    episode_indices = list(range(num_episodes))
+    random.shuffle(episode_indices)
+    episode_idx_pool = deque(episode_indices)
 
     policy.train()
     meters = {
@@ -292,80 +342,248 @@ def train(cfg: TrainPipelineConfig):
         "kld_loss": AverageMeter("kld_loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
-        "episode_s": AverageMeter("ep_s", ":.3f"),
-        "frame_s": AverageMeter("frm_s", ":.3f"),
+        "episode_batch_s": AverageMeter("ep_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
     tracker = MetricsTracker(batch_size, dataset.num_frames, dataset.num_episodes, meters, initial_step=step)
 
-    frames_since_step = 0
-    episode_start_time = time.perf_counter()
+    logging.info("Start offline sequential training with windowed TBPTT")
 
-    logging.info("Start offline sequential training with lockstep episodes")
-
+    # Initialize history cache if policy has history encoder
     if hasattr(policy, "history_encoder"):
-        policy.history_cache = policy.history_encoder.init_cache(batch_size)
-        # device/dtype safety
-        def _to(x):
-            if isinstance(x, (tuple, list)):
-                return type(x)(_to(t) for t in x)
-            return x.to(device) if torch.is_tensor(x) else x
-        policy.history_cache = _to(policy.history_cache)
-    
-    # Number of backward()s since last optimizer step
-    acc_steps = 0
+        policy.history_cache = None
 
     while step < cfg.steps:
+        episode_batch_start_time = time.perf_counter()
         t0 = time.perf_counter()
-        try:
-            frame_indices, reset_mask = next(iterator)
-        except StopIteration:
-            break
+        
+        # Sample B episodes for this batch
+        # Refill pool if needed
+        if len(episode_idx_pool) < batch_size:
+            episode_indices = list(range(num_episodes))
+            random.shuffle(episode_indices)
+            episode_idx_pool.extend(episode_indices)
+        
+        # Sample batch of episode indices
+        sampled_episode_indices = [episode_idx_pool.popleft() for _ in range(batch_size)]
+        
+        # Get episode frame ranges
+        episode_info = []
+        max_episode_length = 0
+        for ep_idx in sampled_episode_indices:
+            start_frame, end_frame, ep_length = get_episode_frames(dataset.episode_data_index, ep_idx)
+            episode_info.append((start_frame, end_frame, ep_length))
+            max_episode_length = max(max_episode_length, ep_length)
+        
         tracker.dataloading_s = time.perf_counter() - t0
+        
+        # Reset hidden states for new batch of episodes
+        if hasattr(policy, "history_cache"):
+            policy.history_cache = None
+        
+        # Process episodes using windowed TBPTT
+        acc_steps = 0
+        total_loss = 0.0
+        loss_dict_accumulator = {}
+        
+        # Slide window across episode length
+        for window_start in range(0, max_episode_length, cfg.policy.window_size):
+            # Calculate actual window size (may be smaller at episode ends)
+            actual_window_size = min(cfg.policy.window_size, max_episode_length - window_start)
+            if actual_window_size <= 0:
+                break
+            
+            # Gather windowed batch (B, K, ...) using persistent DataLoader
+            t_gather0 = time.perf_counter()
+            batch = _gather_windowed_batch_dataloader(
+                frame_dataset,
+                persistent_dataloader,
+                episode_info,
+                actual_window_size,
+                window_start,
+            )
+            gather_ms = (time.perf_counter() - t_gather0) * 1000
 
-        # If any stream is starting a new episode, step optimizer BEFORE processing the new episode
-        # This ensures gradients from different episodes don't get mixed
-        any_stream_starting_new_episode = bool(reset_mask.any())
-        should_step_before_reset = any_stream_starting_new_episode and frames_since_step > 0
+            # Move tensors to device — under optimization, we may move only last-step later
+            t_h2d0 = time.perf_counter()
+            for k, v in list(batch.items()):
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device, non_blocking=device.type == "cuda")
+            h2d_ms = (time.perf_counter() - t_h2d0) * 1000
+            
+            # ---- Drop "dead" streams (no valid steps in this window) to save compute ----
+            if "alive_mask" in batch:
+                alive = batch["alive_mask"]
+                if alive.ndim != 1:
+                    alive = alive.view(-1)
+                if not bool(alive.all()):
+                    # Filter all (B, ..) tensors by alive
+                    for k, v in list(batch.items()):
+                        if isinstance(v, torch.Tensor) and v.shape[:1] == alive.shape:
+                            batch[k] = v[alive]
+                    # Keep TBPTT cache in sync (only if it exists and matches B)
+                    if hasattr(policy, "history_cache") and policy.history_cache is not None:
+                        if torch.is_tensor(policy.history_cache) and policy.history_cache.shape[0] == alive.shape[0]:
+                            policy.history_cache = policy.history_cache[alive]
+            # ---------------------------------------------------------------------------
 
-        if should_step_before_reset:
-            duration = time.perf_counter() - episode_start_time
+            # Accumulate gradients for this window
+            loss_val, loss_dict = _accumulate_windowed_step(
+                policy=policy,
+                batch=batch,
+                grad_scaler=grad_scaler,
+                use_amp=cfg.policy.use_amp,
+            )
+            # attach gather/h2d timings for accumulation
+            loss_dict.setdefault("gather_ms", 0.0)
+            loss_dict.setdefault("h2d_ms", 0.0)
+            loss_dict["gather_ms"] += gather_ms
+            loss_dict["h2d_ms"] += h2d_ms
+            
+            acc_steps += 1
+            total_loss += loss_val
+            
+            # Accumulate loss_dict components
+            for k, v in loss_dict.items():
+                if k not in loss_dict_accumulator:
+                    loss_dict_accumulator[k] = 0.0
+                loss_dict_accumulator[k] += v
+            
+            # Step optimizer every N windows
+            if acc_steps % cfg.policy.windows_per_optimizer_step == 0:
+                denom = acc_steps
+                duration = time.perf_counter() - episode_batch_start_time
+                grad_norm = _optimizer_step(
+                    policy=policy,
+                    optimizer=optimizer,
+                    grad_scaler=grad_scaler,
+                    lr_scheduler=lr_scheduler,
+                    grad_clip_norm=cfg.optimizer.grad_clip_norm,
+                    denom=denom,
+                )
+                step += 1
+                total_optimizer_steps += 1
+                
+                # Update metrics
+                avg_loss = total_loss / acc_steps
+                meters["loss"].update(avg_loss)
+                if "l1_loss" in loss_dict_accumulator:
+                    meters["l1_loss"].update(loss_dict_accumulator["l1_loss"] / acc_steps)
+                if "kld_loss" in loss_dict_accumulator:
+                    meters["kld_loss"].update(loss_dict_accumulator["kld_loss"] / acc_steps)
+                
+                # Debug timing logs (only when debug logging is enabled)
+                if logging.getLogger().isEnabledFor(logging.DEBUG):
+                    if "forward_ms" in loss_dict_accumulator:
+                        fwd_time = loss_dict_accumulator["forward_ms"] / acc_steps
+                        logging.debug(f"Avg forward time: {fwd_time:.1f}ms")
+                    if "backward_ms" in loss_dict_accumulator:
+                        bwd_time = loss_dict_accumulator["backward_ms"] / acc_steps
+                        logging.debug(f"Avg backward time: {bwd_time:.1f}ms")
+                
+                tracker.grad_norm = grad_norm
+                tracker.lr = optimizer.param_groups[0]["lr"]
+                tracker.episode_batch_s = duration
+                tracker.step()
+                
+                # Reset accumulators
+                acc_steps = 0
+                total_loss = 0.0
+                loss_dict_accumulator = {}
+                
+                # Logging and checkpointing
+                # Use total_optimizer_steps for more consistent logging
+                is_log_step = cfg.log_freq > 0 and total_optimizer_steps % cfg.log_freq == 0
+                is_saving_step = cfg.save_freq > 0 and (step % cfg.save_freq == 0 or step == cfg.steps)
+                is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+                
+                if is_log_step:
+                    logging.info(tracker)
+                    if wandb_logger:
+                        wandb_log_dict = tracker.to_dict()
+                        wandb_logger.log_dict(wandb_log_dict, step)
+                    tracker.reset_averages()
+                
+                if cfg.save_checkpoint and is_saving_step:
+                    logging.info(f"Checkpoint policy after step {step}")
+                    checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                    save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, lr_scheduler)
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
+                
+                if cfg.env and is_eval_step and eval_env is not None:
+                    step_id = get_step_identifier(step, cfg.steps)
+                    logging.info(f"Eval policy at step {step}")
+                    with (
+                        torch.no_grad(),
+                        torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext(),
+                    ):
+                        eval_info = eval_policy(
+                            eval_env,
+                            policy,
+                            cfg.eval.n_episodes,
+                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                            max_episodes_rendered=4,
+                            start_seed=cfg.seed,
+                        )
+                    eval_metrics = {
+                        "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                        "pc_success": AverageMeter("success", ":.1f"),
+                        "eval_s": AverageMeter("eval_s", ":.3f"),
+                    }
+                    eval_tracker = MetricsTracker(batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step)
+                    eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
+                    eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
+                    eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
+                    logging.info(eval_tracker)
+                    if wandb_logger:
+                        wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                        wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                        wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
+                
+                if step >= cfg.steps:
+                    break
+
+        # after the for-window loop (still inside the while step loop)
+        if acc_steps > 0:
+            duration = time.perf_counter() - episode_batch_start_time
             grad_norm = _optimizer_step(
                 policy=policy,
                 optimizer=optimizer,
                 grad_scaler=grad_scaler,
                 lr_scheduler=lr_scheduler,
                 grad_clip_norm=cfg.optimizer.grad_clip_norm,
-                denom=acc_steps,
+                denom=acc_steps,                    # use actual count
             )
             step += 1
-            acc_steps = 0
-            frames_since_step = 0
-            episode_start_time = time.perf_counter()
+            total_optimizer_steps += 1
+
+            # Update meters
+            avg_loss = total_loss / acc_steps
+            meters["loss"].update(avg_loss)
+            if "l1_loss" in loss_dict_accumulator:
+                meters["l1_loss"].update(loss_dict_accumulator["l1_loss"] / acc_steps)
+            if "kld_loss" in loss_dict_accumulator:
+                meters["kld_loss"].update(loss_dict_accumulator["kld_loss"] / acc_steps)
 
             tracker.grad_norm = grad_norm
             tracker.lr = optimizer.param_groups[0]["lr"]
-            if duration > 0:
-                tracker.frame_s = duration / max(batch_size, 1)
+            tracker.episode_batch_s = duration
             tracker.step()
 
-            is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+            # Logging and checkpointing (consolidated logic)
+            is_log_step = cfg.log_freq > 0 and total_optimizer_steps % cfg.log_freq == 0
             is_saving_step = cfg.save_freq > 0 and (step % cfg.save_freq == 0 or step == cfg.steps)
             is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
-
+            
             if is_log_step:
                 logging.info(tracker)
                 if wandb_logger:
                     wandb_log_dict = tracker.to_dict()
-                    # Include accumulated loss_dict components like in train.py
-                    if hasattr(tracker, 'step_loss_dict'):
-                        wandb_log_dict.update(tracker.step_loss_dict)
                     wandb_logger.log_dict(wandb_log_dict, step)
                 tracker.reset_averages()
-                # Reset the accumulated loss_dict for the next step
-                if hasattr(tracker, 'step_loss_dict'):
-                    tracker.step_loss_dict = {}
-
+            
             if cfg.save_checkpoint and is_saving_step:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
@@ -373,7 +591,7 @@ def train(cfg: TrainPipelineConfig):
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
-
+            
             if cfg.env and is_eval_step and eval_env is not None:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
@@ -404,50 +622,16 @@ def train(cfg: TrainPipelineConfig):
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
 
-            if step >= cfg.steps:
-                break
+            # Reset accumulators
+            acc_steps = 0
+            total_loss = 0.0
+            loss_dict_accumulator = {}
 
-        # Use sequential/streaming training
-        batch = _gather_batch(dataset, frame_indices)
 
-        # Move tensors to device
-        for k, v in list(batch.items()):
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.to(device, non_blocking=device.type == "cuda")
-
-        # Masked per-stream history reset for sequential training
-        _masked_history_reset(policy, reset_mask.to(device), fresh_template=None)
-
-        # Accumulate gradients per frame
-        loss_val, loss_dict = _accumulate_step(
-            policy=policy,
-            batch=batch,
-            grad_scaler=grad_scaler,
-            use_amp=cfg.policy.use_amp,
-        )
-        # Count the number of accumulated steps
-        acc_steps += 1
-
-        meters["loss"].update(loss_val)
-        if "l1_loss" in loss_dict:
-            meters["l1_loss"].update(loss_dict["l1_loss"])
-        if "kld_loss" in loss_dict:
-            meters["kld_loss"].update(loss_dict["kld_loss"])
-        frames_since_step += batch_size
-
-        if step >= cfg.steps:
-            break
-
-    if acc_steps > 0:
-        _ = _optimizer_step(
-            policy=policy,
-            optimizer=optimizer,
-            grad_scaler=grad_scaler,
-            lr_scheduler=lr_scheduler,
-            grad_clip_norm=cfg.optimizer.grad_clip_norm,
-            denom=acc_steps,
-        )
-
+    # Clean up history cache before ending training
+    if hasattr(policy, "history_cache") and policy.history_cache is not None:
+        policy.history_cache = None
+        
     if eval_env:
         eval_env.close()
     logging.info("End of sequential training")
