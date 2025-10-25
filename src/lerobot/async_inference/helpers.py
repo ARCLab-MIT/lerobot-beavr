@@ -16,7 +16,7 @@ import logging
 import logging.handlers
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -60,15 +60,6 @@ def visualize_action_queue_size(action_queue_size: list[int]) -> None:
     ax.grid(True, alpha=0.3)
     ax.plot(range(len(action_queue_size)), action_queue_size)
     plt.show()
-
-
-def validate_robot_cameras_for_policy(
-    lerobot_observation_features: dict[str, dict], policy_image_features: dict[str, PolicyFeature]
-) -> None:
-    image_keys = list(filter(is_image_key, lerobot_observation_features))
-    assert set(image_keys) == set(policy_image_features.keys()), (
-        f"Policy image features must match robot cameras! Received {list(policy_image_features.keys())} != {image_keys}"
-    )
 
 
 def map_robot_keys_to_lerobot_features(robot: Robot) -> dict[str, dict]:
@@ -277,6 +268,7 @@ class RemotePolicyConfig:
     lerobot_features: dict[str, PolicyFeature]
     actions_per_chunk: int
     device: str = "cpu"
+    rename_map: dict[str, str] = field(default_factory=dict)
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

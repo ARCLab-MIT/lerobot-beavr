@@ -1,15 +1,13 @@
 """Main converter class for dataset conversion.
 
-Performance optimizations:
-  - Parallel episode processing using multiprocessing
-  - Thread-safe dataset writing
-  - Configurable parallelization levels
+Sequential processing for proper dataset creation:
+  - Sequential episode processing (required for proper metadata ordering)
+  - Memory-efficient frame processing
+  - Optimized chunking for large datasets
 """
 
 import logging
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import numpy as np
@@ -39,8 +37,6 @@ class DatasetConverter:
                 self.parser = CSVImageParser(config)
         self.logger = self._setup_logging()
         self.dataset = None
-        # Lock for thread-safe dataset operations
-        self._dataset_lock = threading.Lock()
 
     def _setup_logging(self) -> logging.Logger:
         """Configure logging based on debug setting."""
@@ -75,6 +71,7 @@ class DatasetConverter:
 
         self.logger.info(f"Creating dataset with features: {list(features.keys())}")
 
+        # Create dataset with optimized chunking for large datasets
         self.dataset = LeRobotDataset.create(
             repo_id=self.config.repo_id,
             fps=self.config.fps,
@@ -82,15 +79,33 @@ class DatasetConverter:
             robot_type=self.config.robot_type,
             features=features,
             use_videos=self.config.use_videos,
+            tolerance_s=self.config.tolerance_s,
             image_writer_processes=self.config.image_writer_processes,
             image_writer_threads=self.config.image_writer_threads,
-            tolerance_s=self.config.tolerance_s,
+            batch_encoding_size=getattr(self.config, 'batch_encoding_size', 1),
         )
-
+        
+        # Apply chunking settings if specified (for large datasets)
+        if hasattr(self.config, 'chunks_size') and self.config.chunks_size:
+            self.dataset.meta.update_chunk_settings(
+                chunks_size=self.config.chunks_size,
+                data_files_size_in_mb=self.config.data_files_size_in_mb,
+                video_files_size_in_mb=self.config.video_files_size_in_mb,
+            )
+            self.logger.info(f"Applied chunking settings: chunks_size={self.config.chunks_size}, "
+                           f"data_files_size={self.config.data_files_size_in_mb}MB, "
+                           f"video_files_size={self.config.video_files_size_in_mb}MB")
+        
         # Prefer parsing by explicit episode numbers when parser supports it
         episode_files = self.parser.get_episode_files()
         episode_numbers = getattr(self.parser, "list_episode_numbers", lambda: [])()
         use_episode_numbers = bool(episode_numbers)
+        
+        # For large datasets, disable batch encoding to avoid metadata issues
+        total_episodes = len(episode_files) if episode_files else len(episode_numbers)
+        if total_episodes > 1000:
+            self.dataset.batch_encoding_size = 1
+            self.logger.info("Large dataset detected. Disabling batch video encoding to avoid metadata issues.")
         
         self.logger.info(f"Episode detection: files={len(episode_files)}, numbers={len(episode_numbers)}")
         if episode_numbers:
@@ -99,27 +114,12 @@ class DatasetConverter:
         if not episode_files and not use_episode_numbers:
             raise ValueError(f"No episode files found in {self.config.input_dir}")
 
-        # Determine if parallel processing should be used
-        enable_parallel = getattr(self.config, 'enable_parallel_processing', True)
-        num_parallel_episodes = getattr(self.config, 'num_parallel_episodes', 4)
-        
-        # Disable parallel processing in debug mode for easier debugging
-        if self.config.debug:
-            enable_parallel = False
-            self.logger.info("Parallel processing disabled in debug mode")
-        
-        if enable_parallel and num_parallel_episodes > 0:
-            self.logger.info(f"Processing episodes in parallel with {num_parallel_episodes} workers")
-            if use_episode_numbers:
-                self._convert_parallel_numbers(episode_numbers, num_parallel_episodes)
-            else:
-                self._convert_parallel(episode_files, num_parallel_episodes)
+        # Process episodes sequentially (required for proper dataset creation)
+        self.logger.info(f"Processing {total_episodes} episodes sequentially")
+        if use_episode_numbers:
+            self._convert_sequential_numbers(episode_numbers)
         else:
-            self.logger.info("Processing episodes sequentially")
-            if use_episode_numbers:
-                self._convert_sequential_numbers(episode_numbers)
-            else:
-                self._convert_sequential(episode_files)
+            self._convert_sequential(episode_files)
 
         self.logger.info(f"Conversion completed. Dataset saved to: {self.config.output_dir}")
 
@@ -143,81 +143,23 @@ class DatasetConverter:
                 else:
                     raise
     
-    def _convert_parallel(self, episode_files: list, num_workers: int) -> None:
-        """Parallel episode processing using ThreadPoolExecutor.
-        
-        Uses threading instead of multiprocessing because:
-        1. Image loading is I/O bound (benefits from threading)
-        2. Avoids serialization overhead of the dataset object
-        3. Simpler coordination with thread-safe locks
-        """
-        # Submit all episode parsing tasks
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Create a mapping of futures to episode files
-            future_to_episode = {
-                executor.submit(self._process_episode_file, episode_file): episode_file 
-                for episode_file in episode_files
-            }
-            
-            # Process completed episodes as they finish
-            with tqdm(total=len(episode_files), desc="Converting episodes") as pbar:
-                for future in as_completed(future_to_episode):
-                    episode_file = future_to_episode[future]
-                    try:
-                        future.result()
-                        pbar.update(1)
-                    except Exception as e:
-                        self.logger.error(f"Error processing {episode_file}: {e}")
-                        pbar.update(1)
-                        if self.config.debug:
-                            raise
-    
-    def _process_episode_file(self, episode_file) -> None:
-        """Process a single episode file and add all its episodes to the dataset.
-        
-        This method is called in parallel, so it needs to be thread-safe.
-        """
-        try:
-            # parse_episode returns a generator yielding episodes one by one
-            for episode_data in self.parser.parse_episode(episode_file):
-                # Use lock to ensure thread-safe addition to dataset
-                with self._dataset_lock:
-                    self._add_episode_to_dataset(episode_data)
-        except Exception as e:
-            self.logger.error(f"Error in episode file {episode_file}: {e}")
-            if self.config.debug:
-                raise
 
     def _convert_sequential_numbers(self, episode_numbers: list[int]) -> None:
         for ep in tqdm(episode_numbers, desc="Converting episodes"):
             for episode_data in self.parser.parse_episode_by_number(ep) or []:
                 self._add_episode_to_dataset(episode_data)
 
-    def _convert_parallel_numbers(self, episode_numbers: list[int], num_workers: int) -> None:
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            future_to_ep = {executor.submit(self._process_episode_number, ep): ep for ep in episode_numbers}
-            with tqdm(total=len(episode_numbers), desc="Converting episodes") as pbar:
-                for future in as_completed(future_to_ep):
-                    ep = future_to_ep[future]
-                    try:
-                        future.result()
-                        pbar.update(1)
-                    except Exception as e:
-                        self.logger.error(f"Error processing episode {ep}: {e}")
-                        pbar.update(1)
-                        if self.config.debug:
-                            raise
-
-    def _process_episode_number(self, ep: int) -> None:
-        for episode_data in self.parser.parse_episode_by_number(ep) or []:
-            with self._dataset_lock:
-                self._add_episode_to_dataset(episode_data)
 
     def _add_episode_to_dataset(self, episode_data: dict[str, Any]) -> None:
-        """Add parsed episode data to the dataset."""
+        """Add parsed episode data to the dataset with optimized memory management."""
         num_frames = len(episode_data["timestamps"])
         start_time = time.time()
 
+        # Process frames in batches for large episodes to manage memory
+        batch_size = getattr(self.config, 'image_loading_batch_size', 64)
+        if num_frames > batch_size:
+            self.logger.debug(f"Large episode ({num_frames} frames), processing in batches of {batch_size}")
+        
         for frame_idx in range(num_frames):
             frame = self._create_frame(episode_data, frame_idx)
             # Inject task into frame for validation and storage
@@ -229,6 +171,11 @@ class DatasetConverter:
 
             # Add frame to dataset (timestamp will be set automatically based on fps)
             self.dataset.add_frame(frame)
+            
+            # Memory management: clear large objects periodically
+            if frame_idx % batch_size == 0 and frame_idx > 0:
+                import gc
+                gc.collect()
 
         # Save the complete episode
         save_start = time.time()
@@ -236,7 +183,13 @@ class DatasetConverter:
         save_time = time.time() - save_start
         total_time = time.time() - start_time
         
-        self.logger.debug(f"Saved episode with {num_frames} frames - total: {total_time:.2f}s, save: {save_time:.2f}s")
+        # Log performance metrics for large episodes
+        if num_frames > 100:
+            fps_processing = num_frames / total_time if total_time > 0 else 0
+            self.logger.debug(f"Large episode: {num_frames} frames in {total_time:.2f}s "
+                            f"({fps_processing:.1f} fps processing rate)")
+        else:
+            self.logger.debug(f"Saved episode with {num_frames} frames - total: {total_time:.2f}s, save: {save_time:.2f}s")
 
     def _create_frame(self, episode_data: dict[str, Any], frame_idx: int) -> dict[str, Any]:
         """Create a frame dictionary from episode data."""

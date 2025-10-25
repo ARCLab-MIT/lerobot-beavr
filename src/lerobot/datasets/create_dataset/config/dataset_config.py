@@ -39,16 +39,21 @@ class DatasetConfig:
     image_keys: list[str] = field(default_factory=lambda: ["observation.images.camera"])
 
     # Processing options
-    use_videos: bool = False
+    use_videos: bool = True
     image_writer_processes: int = 0
     image_writer_threads: int = 4
     tolerance_s: float = 1e-4
+    batch_encoding_size: int = 1
     
-    # Parallel processing options
-    num_parallel_episodes: int = 8  # Number of episodes to process in parallel (0 = sequential)
+    # Chunking and file size options (for large datasets)
+    chunks_size: int | None = None  # Max files per chunk directory
+    data_files_size_in_mb: int | None = None  # Max size for data parquet files in MB
+    video_files_size_in_mb: int | None = None  # Max size for video files in MB
+    metadata_buffer_size: int = 10  # Buffer size for metadata batching
+    
+    # Image processing options
     num_image_loading_threads: int = 16  # Number of threads for batch image loading within episodes
     image_loading_batch_size: int = 64  # Number of images to load in a single batch
-    enable_parallel_processing: bool = True  # Master flag to enable/disable parallelization
 
     # Validation and debugging
     debug: bool = False

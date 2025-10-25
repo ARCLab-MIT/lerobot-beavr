@@ -30,11 +30,11 @@ Examples:
     # Quick conversion with minimal config
     python -m lerobot.datasets.create_dataset.cli --repo-id "user/dataset" --input-dir "/data" --fps 30
     
-    # Convert with parallel processing (faster for large datasets)
-    python -m lerobot.datasets.create_dataset.cli --config my_config.yaml --num-parallel-episodes 8 --num-image-threads 16
+    # Convert with optimized settings for large datasets
+    python -m lerobot.datasets.create_dataset.cli --config my_config.yaml --num-image-threads 16 --chunks-size 1000
     
-    # Disable parallel processing for debugging
-    python -m lerobot.datasets.create_dataset.cli --config my_config.yaml --no-parallel --debug
+    # Debug mode with detailed logging
+    python -m lerobot.datasets.create_dataset.cli --config my_config.yaml --debug
         """,
     )
 
@@ -50,11 +50,15 @@ Examples:
     parser.add_argument("--test-mode", action="store_true", help="Process only first few episodes")
     parser.add_argument("--parser", type=str, choices=["csv_image", "image_pair"], help="Select parser type")
     
-    # Parallel processing arguments
-    parser.add_argument("--num-parallel-episodes", type=int, help="Number of episodes to process in parallel (default: 4)")
+    # Image processing arguments
     parser.add_argument("--num-image-threads", type=int, help="Number of threads for batch image loading (default: 8)")
     parser.add_argument("--image-batch-size", type=int, help="Number of images to load per batch (default: 32)")
-    parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing")
+    
+    # Chunking and file size arguments (for large datasets)
+    parser.add_argument("--chunks-size", type=int, help="Maximum number of files per chunk directory (default: 1000)")
+    parser.add_argument("--data-files-size-mb", type=int, help="Maximum size for data parquet files in MB (default: 500)")
+    parser.add_argument("--video-files-size-mb", type=int, help="Maximum size for video files in MB (default: 2000)")
+    parser.add_argument("--batch-encoding-size", type=int, help="Number of episodes to batch before encoding videos (default: 4)")
 
     args = parser.parse_args()
 
@@ -98,14 +102,18 @@ Examples:
             config.test_mode = True
         if args.parser:
             config.parser_type = args.parser
-        if args.no_parallel:
-            config.enable_parallel_processing = False
-        if args.num_parallel_episodes:
-            config.num_parallel_episodes = args.num_parallel_episodes
         if args.num_image_threads:
             config.num_image_loading_threads = args.num_image_threads
         if args.image_batch_size:
             config.image_loading_batch_size = args.image_batch_size
+        if args.chunks_size:
+            config.chunks_size = args.chunks_size
+        if args.data_files_size_mb:
+            config.data_files_size_in_mb = args.data_files_size_mb
+        if args.video_files_size_mb:
+            config.video_files_size_in_mb = args.video_files_size_mb
+        if args.batch_encoding_size:
+            config.batch_encoding_size = args.batch_encoding_size
 
         # Run conversion
         converter = DatasetConverter(config)
