@@ -211,7 +211,14 @@ def load_optimizer_state(
 def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Path) -> torch.optim.Optimizer:
     """Load a single optimizer's state from disk."""
     current_state_dict = optimizer.state_dict()
-    flat_state = load_file(save_dir / OPTIMIZER_STATE)
+    # Check if optimizer state file exists (may be missing if checkpoint saving failed)
+    optimizer_state_file = save_dir / OPTIMIZER_STATE
+    if not optimizer_state_file.exists():
+        # Optimizer state is missing, return optimizer with fresh state
+        # This can happen if checkpoint saving failed during optimizer state serialization
+        return optimizer
+    
+    flat_state = load_file(optimizer_state_file)
     state = unflatten_dict(flat_state)
 
     # Handle case where 'state' key might not exist (for newly created optimizers)

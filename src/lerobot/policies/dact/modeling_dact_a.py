@@ -245,11 +245,11 @@ class DACTPolicyA(PreTrainedPolicy):
             imgs_last = [imgs.select(1, -1).contiguous(memory_format=torch.channels_last) for imgs in batch[OBS_IMAGES]]
             batch[OBS_IMAGES] = imgs_last
         if OBS_STATE in batch and batch[OBS_STATE].dim() > 2:
-            batch[OBS_STATE] = batch[OBS_STATE].select(1, -1)
+            batch[OBS_STATE] = batch[OBS_STATE].select(1, -1).contiguous()
         if ACTION in batch and batch[ACTION].dim() > 3:
-            batch[ACTION] = batch[ACTION].select(1, -1)
+            batch[ACTION] = batch[ACTION].select(1, -1).contiguous()
         if "action_is_pad" in batch and batch["action_is_pad"].dim() > 2:
-            batch["action_is_pad"] = batch["action_is_pad"].select(1, -1)
+            batch["action_is_pad"] = batch["action_is_pad"].select(1, -1).contiguous()
         postprocess_time = (time.perf_counter() - postprocess_start) * 1000
         timing_dict['postprocess_ms'] = postprocess_time
 
@@ -378,7 +378,7 @@ class DACT(nn.Module):
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
-            self.backbone = self.backbone.to(memory_format=torch.channels_last)
+            # self.backbone = self.backbone.to(memory_format=torch.channels_last)
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -400,7 +400,7 @@ class DACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
-            self.encoder_img_feat_input_proj = self.encoder_img_feat_input_proj.to(memory_format=torch.channels_last)
+            # self.encoder_img_feat_input_proj = self.encoder_img_feat_input_proj.to(memory_format=torch.channels_last)
 
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -535,6 +535,7 @@ class DACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
+                img = img.contiguous(memory_format=torch.channels_last)
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
@@ -621,7 +622,7 @@ class HistoryEncoder(nn.Module):
             self.hist_backbone = IntermediateLayerGetter(history_backbone_model, return_layers={"layer4": "feature_map"})
             # Expose backbone output channels for consumers
             self.hist_backbone_out_channels = history_backbone_model.fc.in_features
-            self.hist_backbone = self.hist_backbone.to(memory_format=torch.channels_last)
+            # self.hist_backbone = self.hist_backbone.to(memory_format=torch.channels_last)
             
             # Freeze the history backbone parameters
             for param in self.hist_backbone.parameters():
@@ -747,6 +748,7 @@ class HistoryEncoder(nn.Module):
         # ---- per-step visual features for each camera -> (B, D) ----
         per_cam_feats: list[Tensor] = []
         for img in batch[OBS_IMAGES]:
+            img = img.contiguous(memory_format=torch.channels_last)
             raw = self.hist_backbone(img)                 # {"feature_map": ...}
             fmap = raw["feature_map"]                     # (B, Cb, H', W')
             feat = self.spatial_adapter(fmap)             # (B, D)

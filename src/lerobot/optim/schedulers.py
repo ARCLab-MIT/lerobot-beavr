@@ -117,6 +117,16 @@ def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
 
 
 def load_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> LRScheduler:
-    state_dict = deserialize_json_into_object(save_dir / SCHEDULER_STATE, scheduler.state_dict())
+    """Load scheduler state from disk, handling missing state files gracefully."""
+    scheduler_state_file = save_dir / SCHEDULER_STATE
+    if not scheduler_state_file.exists():
+        # Scheduler state is missing, return scheduler with fresh state
+        # This can happen if checkpoint saving failed during scheduler state serialization
+        import logging
+        logging.warning(f"Scheduler state file not found at {scheduler_state_file}. "
+                       f"Resuming with fresh scheduler state.")
+        return scheduler
+    
+    state_dict = deserialize_json_into_object(scheduler_state_file, scheduler.state_dict())
     scheduler.load_state_dict(state_dict)
     return scheduler

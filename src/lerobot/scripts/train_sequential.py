@@ -207,6 +207,9 @@ def _accumulate_windowed_step(policy: PreTrainedPolicy, batch: Any, grad_scaler:
     forward_time = (time.perf_counter() - forward_start) * 1000  # ms
     step_timings['forward_ms'] = forward_time
     
+    # Store unscaled loss for logging
+    unscaled_loss = float(loss.item())
+    
     # Backward pass timing
     backward_start = time.perf_counter()
     grad_scaler.scale(loss).backward()
@@ -216,7 +219,8 @@ def _accumulate_windowed_step(policy: PreTrainedPolicy, batch: Any, grad_scaler:
     # Add timing info to loss_dict for logging
     loss_dict.update(step_timings)
     
-    return float(loss.item()), loss_dict
+    # Return unscaled loss for logging purposes
+    return unscaled_loss, loss_dict
 
 
 def _optimizer_step(
@@ -225,14 +229,14 @@ def _optimizer_step(
     grad_scaler: GradScaler,
     lr_scheduler,
     grad_clip_norm: float,
-    denom: int,
 ) -> float:
+    """
+    Perform optimizer step with gradient clipping.
+    
+    Note: No gradient scaling is performed. Accumulated gradients represent
+    an effective batch size of (batch_size * num_accumulation_steps).
+    """
     grad_scaler.unscale_(optimizer)
-    denom = max(denom, 1)
-    for group in optimizer.param_groups:
-        for p in group["params"]:
-            if p.grad is not None:
-                p.grad.data.mul_(1.0 / denom)
     grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip_norm, error_if_nonfinite=False)
     grad_scaler.step(optimizer)
     grad_scaler.update()
@@ -451,7 +455,6 @@ def train(cfg: TrainPipelineConfig):
             
             # Step optimizer every N windows
             if acc_steps % cfg.policy.windows_per_optimizer_step == 0:
-                denom = acc_steps
                 duration = time.perf_counter() - episode_batch_start_time
                 grad_norm = _optimizer_step(
                     policy=policy,
@@ -459,7 +462,6 @@ def train(cfg: TrainPipelineConfig):
                     grad_scaler=grad_scaler,
                     lr_scheduler=lr_scheduler,
                     grad_clip_norm=cfg.optimizer.grad_clip_norm,
-                    denom=denom,
                 )
                 step += 1
                 total_optimizer_steps += 1
@@ -554,7 +556,6 @@ def train(cfg: TrainPipelineConfig):
                 grad_scaler=grad_scaler,
                 lr_scheduler=lr_scheduler,
                 grad_clip_norm=cfg.optimizer.grad_clip_norm,
-                denom=acc_steps,                    # use actual count
             )
             step += 1
             total_optimizer_steps += 1
