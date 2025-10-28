@@ -106,8 +106,9 @@ class ACTConfig(PreTrainedConfig):
     # Architecture.
     # Vision backbone.
     vision_backbone: str = "resnet18"
-    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
-    replace_final_stride_with_dilation: int = False
+    # pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    pretrained_backbone_weights: str | None = None
+    replace_final_stride_with_dilation: int = True
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512

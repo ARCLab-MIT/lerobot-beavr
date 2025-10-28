@@ -178,11 +178,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-<<<<<<< HEAD
-    logging.info("Creating dataset")
-    dataset = make_dataset(cfg)
-    print(f"cfg: {cfg}")
-=======
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
         logging.info("Creating dataset")
@@ -193,7 +188,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
->>>>>>> f25ac02e6c8fa9c467ab8462289e5f4aed3a2e85
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,

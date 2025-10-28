@@ -20,9 +20,9 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 
 
-@PreTrainedConfig.register_subclass("dact_a")
+@PreTrainedConfig.register_subclass("sact")
 @dataclass
-class DACTConfigA(PreTrainedConfig):
+class SACTConfig(PreTrainedConfig):
     """Configuration class for the Action Chunking Transformers policy.
 
     Defaults are configured for training on bimanual Aloha tasks like "insertion" or "transfer".
@@ -91,9 +91,9 @@ class DACTConfigA(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 2
-    chunk_size: int = 100
-    n_action_steps: int = 1
+    n_obs_steps: int = 1
+    chunk_size: int = 3
+    n_action_steps: int = 3
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -105,12 +105,15 @@ class DACTConfigA(PreTrainedConfig):
 
     # Architecture.
     # Vision backbone.
-    vision_backbone: str = "resnet18"
-    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
-    replace_final_stride_with_dilation: int = False
-    # Transformer layers.
+    vision_backbone: str | None = None
+    # pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    pretrained_backbone_weights: str | None = None
+    replace_final_stride_with_dilation: int = True
+    # Transformer layers.loss
     pre_norm: bool = False
     dim_model: int = 512
+    hidden_channels: int = 256
+    input_channels: int = 3
     n_heads: int = 8
     dim_feedforward: int = 3200
     feedforward_activation: str = "relu"
@@ -126,11 +129,12 @@ class DACTConfigA(PreTrainedConfig):
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
-    temporal_ensemble_coeff: float | None = 0.01
+    temporal_ensemble_coeff: float | None = None
 
     # Training and loss computation.
     dropout: float = 0.1
-    kl_weight: float = 10.0
+    ce_weight: float = 10.0
+    kl_weight: float = 1.0
 
     # Training preset
     optimizer_lr: float = 1e-5
@@ -141,7 +145,7 @@ class DACTConfigA(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        if self.vision_backbone is not None and not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
@@ -154,6 +158,10 @@ class DACTConfigA(PreTrainedConfig):
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
+            )
+        if self.n_obs_steps != 1:
+            raise ValueError(
+                f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:
@@ -170,8 +178,8 @@ class DACTConfigA(PreTrainedConfig):
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
     @property
-    def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+    def observation_delta_indices(self) -> None:
+        return None
 
     @property
     def action_delta_indices(self) -> list:

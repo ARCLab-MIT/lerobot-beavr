@@ -2,7 +2,7 @@
 
 DEFAULT_CONFIG = {
     "repo_id": "aposadasn/image2image_point_action",
-    "fps": 1,
+    "fps": 30,
     "robot_type": "custom",
     "task_name": "Sensor tasking",
     "input_dir": "/mnt/data/aposadasn/datafromEnrico/diff_train",
@@ -19,17 +19,13 @@ DEFAULT_CONFIG = {
     "test_mode": False,
     "push_to_hub": True,
     "private_repo": False,
-    "tolerance_s": 1.0,
+    "tolerance_s": 1e-4,
     # image_pair parser options
     "parser_type": "image_pair",
     "input_subdir": "input_ag3_byepisode",
     "action_subdir": "action_ag3_byepisode",
     "action_threshold": 200,
     "num_agents": 3,
-    # Chunking and file size options for large datasets (100K episodes)
-    # "chunks_size": 1000,  # Max files per chunk directory
-    # "data_files_size_in_mb": 500,  # Max size for data parquet files in MB
-    # "video_files_size_in_mb": 2000,  # Max size for video files in MB
-    # "metadata_buffer_size": 50,  # Buffer size for metadata batching
-    # "batch_encoding_size": 4,  # Batch episodes before encoding videos
+    # "batch_encoding_size": 1,
+    # "max_test_episodes": 2,
 }

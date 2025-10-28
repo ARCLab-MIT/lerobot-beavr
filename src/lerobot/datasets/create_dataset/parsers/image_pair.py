@@ -105,8 +105,15 @@ class ImagePairParser(DataParser):
             if m:
                 episode_nums.add(int(m.group(1)))
         
-        self.logger.info(f"Scanned {file_count} files in {input_dir}, found {len(episode_nums)} unique episodes")
-        return sorted(episode_nums)
+        episode_numbers = sorted(episode_nums)
+        self.logger.info(f"Scanned {file_count} files in {input_dir}, found {len(episode_numbers)} unique episodes")
+        
+        # Apply test mode limiting
+        if self.config.test_mode:
+            episode_numbers = episode_numbers[:self.config.max_test_episodes]
+            self.logger.info(f"Test mode: limiting to first {len(episode_numbers)} episodes")
+        
+        return episode_numbers
 
     def parse_episode_by_number(self, episode_num: int):
         """Parse and yield a single episode by its number.

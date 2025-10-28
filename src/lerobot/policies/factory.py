@@ -29,7 +29,7 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.dact.configuration_dact_a import DACTConfigA
+from lerobot.policies.dact.configuration_dact_a import SACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -103,17 +103,16 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
-<<<<<<< HEAD
-    elif name == "dact_a":
-        from lerobot.policies.dact.modeling_dact_a import DACTPolicyA
 
-        return DACTPolicyA
-=======
     elif name == "groot":
         from lerobot.policies.groot.modeling_groot import GrootPolicy
 
         return GrootPolicy
->>>>>>> f25ac02e6c8fa9c467ab8462289e5f4aed3a2e85
+
+    elif name == "sact":
+        from lerobot.policies.dact.modeling_dact_a import SACTPolicy
+
+        return SACTPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -153,8 +152,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
-    elif policy_type == "dact_a":
-        return DACTConfigA(**kwargs)
+    elif policy_type == "sact":
+        return SACTConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
     elif policy_type == "groot":
@@ -335,6 +334,14 @@ def make_pre_post_processors(
         from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
 
         processors = make_groot_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SACTConfig):
+        from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+        processors = make_act_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .act.configuration_act import ACTConfig as ACTConfig
-from .dact.configuration_dact_a import DACTConfigA as DACTConfigA
+from .dact.configuration_dact_a import SACTConfig as SACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
@@ -32,4 +32,5 @@ __all__ = [
     "TDMPCConfig",
     "VQBeTConfig",
     "GrootConfig",
+    "SACTConfig",
 ]
