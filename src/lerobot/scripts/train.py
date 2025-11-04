@@ -141,15 +141,6 @@ def train(cfg: TrainPipelineConfig):
         ds_meta=dataset.meta,
     )
 
-    for p in policy.history_encoder.mamba.parameters():
-        p.requires_grad = False
-
-    for p in policy.history_encoder.hist_backbone.parameters():
-        p.requires_grad = True
-
-    for p in policy.history_encoder.spatial_adapter.parameters():
-        p.requires_grad = True
-
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
     grad_scaler = GradScaler(device.type, enabled=cfg.policy.use_amp)

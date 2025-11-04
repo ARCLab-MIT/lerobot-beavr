@@ -763,5 +763,3 @@ class MambaPolicy(nn.Module):
         actions = self.out_proj(x)
         actions = actions.view(B, L, self.future_steps, self.action_dim)
         return actions
-
-

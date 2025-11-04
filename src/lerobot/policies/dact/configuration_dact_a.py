@@ -92,11 +92,9 @@ class DACTConfigA(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 1
+    n_obs_steps: int = 2
     chunk_size: int = 100
     n_action_steps: int = 100
-    window_size: int = 32
-    windows_per_optimizer_step: int = 4
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -146,17 +144,19 @@ class DACTConfigA(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-5
     optimizer_lr_backbone: float = 1e-5
     num_warmup_steps: int = 0
-    num_decay_steps: int = 40000
+    num_decay_steps: int = 100000
 
     # History encoder (Mamba-based) configuration
-    history_d_state: int = 256
+    history_d_state: int = 2048
     history_d_conv: int = 4
     history_expand: int = 2
     history_headdim: int = 128
     history_use_mem_eff_path: bool = True
 
-    num_cameras: int = 1
+    freeze_history_backbone: bool = False
 
+    # Whether to use history conditioning in the decoder
+    use_history_conditioning: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -199,8 +199,8 @@ class DACTConfigA(PreTrainedConfig):
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list:
+        return list(range(1 - self.n_obs_steps, 1))
 
     @property
     def action_delta_indices(self) -> list:
