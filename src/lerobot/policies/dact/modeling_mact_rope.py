@@ -7,18 +7,18 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
+from rotary_embedding_torch import RotaryEmbedding
 from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.modeling_act import (
-    ACTDecoder,
-    ACTEncoder,
-    ACTSinusoidalPositionEmbedding2d,
     ACTTemporalEnsembler,
+    get_activation_fn,
 )
 from lerobot.policies.dact.configuration_mact import MACTConfig
 from lerobot.policies.dact.mamba2 import CrossCameraAttention, CrossModalAttention, Mamba2, Mamba2Config
+from lerobot.policies.dact.rope import RoPEMultiheadAttention
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -280,7 +280,7 @@ class MACT(nn.Module):
         self.config = config
 
         if self.config.use_vae:
-            self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
+            self.vae_encoder = MACTEncoder(config, is_vae_encoder=True)
             self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
             # Projection layer for joint-space configuration to hidden dimension.
             if self.config.robot_state_feature:
@@ -294,14 +294,13 @@ class MACT(nn.Module):
             )
             # Projection layer from the VAE encoder's output to the latent distribution's parameter space.
             self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
-            # Fixed sinusoidal positional embedding for the input to the VAE encoder. Unsqueeze for batch
-            # dimension.
-            num_input_token_encoder = 1 + config.chunk_size
-            if self.config.robot_state_feature:
-                num_input_token_encoder += 1
-            self.register_buffer(
-                "vae_encoder_pos_enc",
-                create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
+
+            # RoPE for the VAE encoder
+            vae_head_dim = config.dim_model // config.n_heads
+            vae_rope_dim = int(vae_head_dim * config.rope_partial_rotary_factor)
+            self.vae_encoder_rope = RotaryEmbedding(
+                dim=vae_rope_dim,
+                theta=config.rope_theta,
             )
 
         # Backbone for image feature extraction.
@@ -317,11 +316,11 @@ class MACT(nn.Module):
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # Transformer (acts as VAE decoder when training with the variational objective).
-        self.encoder = ACTEncoder(config)
-        self.decoder = ACTDecoder(config)
+        self.encoder = MACTEncoder(config)
+        self.decoder = MACTDecoder(config)
 
         # Transformer encoder input projections. The tokens will be structured like
-        # [history_tokens, latent, (robot_state), (env_state), (image_feature_map_pixels)].
+        # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
                 self.config.robot_state_feature.shape[0], config.dim_model
@@ -335,23 +334,19 @@ class MACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
-        # Transformer encoder positional embeddings.
-        n_1d_tokens = 1  # for the latent
-        if self.config.robot_state_feature:
-            n_1d_tokens += 1
-        if self.config.env_state_feature:
-            n_1d_tokens += 1
-        # Note: history tokens get their own separate positional embeddings
-        self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
-        if self.config.image_features:
-            self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
+
+        # RoPE for positional embeddings
+        # RoPE dimension must match per-head dimension (or partial rotary factor of it)
+        head_dim = config.dim_model // config.n_heads
+        rope_dim = int(head_dim * config.rope_partial_rotary_factor)
+        self.encoder_rope = RotaryEmbedding(
+            dim=rope_dim,
+            theta=config.rope_theta,
+        )
 
         # Transformer decoder.
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
-
-        # Positional embeddings for history tokens (used as encoder inputs)
-        self.history_pos_embed = nn.Embedding(config.n_history_tokens, config.dim_model)
 
         # Final action regression head on the output of the transformer's decoder.
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
@@ -433,9 +428,8 @@ class MACT(nn.Module):
                 vae_encoder_input = [cls_embed, action_embed]
             vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
 
-            # Prepare fixed positional embedding.
-            # Note: detach() shouldn't be necessary but leaving it the same as the original code just in case.
-            pos_embed = self.vae_encoder_pos_enc.clone().detach()  # (1, S+2, D)
+            # Prepare RoPE for VAE encoder.
+            rope = self.vae_encoder_rope
 
             # Prepare key padding mask for the transformer encoder. We have 1 or 2 extra tokens at the start of the
             # sequence depending whether we use the input states or not (cls and robot state)
@@ -452,8 +446,9 @@ class MACT(nn.Module):
             # Forward pass through VAE encoder to get the latent PDF parameters.
             cls_token_out = self.vae_encoder(
                 vae_encoder_input.permute(1, 0, 2),
-                pos_embed=pos_embed.permute(1, 0, 2),
+                pos_embed=None,
                 key_padding_mask=key_padding_mask,
+                rope=rope,
             )[0]  # select the class token, with shape (B, D)
             latent_pdf_params = self.vae_encoder_latent_output_proj(cls_token_out)
             mu = latent_pdf_params[:, : self.config.latent_dim]
@@ -471,23 +466,8 @@ class MACT(nn.Module):
             )
 
         # Prepare transformer encoder inputs.
-        # Start with history tokens
-        history_cond = batch[HISTORY_TOKEN]  # (B, n_tokens, D)
-        n_tokens = history_cond.shape[1]
-        history_cond_seq = history_cond.transpose(0, 1)  # (n_tokens, B, D)
-
-        encoder_in_tokens = []
-        encoder_in_pos_embed = []
-
-        # Add history tokens and their positional embeddings
-        for i in range(n_tokens):
-            encoder_in_tokens.append(history_cond_seq[i])
-            encoder_in_pos_embed.append(self.history_pos_embed.weight[-n_tokens + i].unsqueeze(0))
-
-        # Add latent token
-        encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample))
-        encoder_in_pos_embed.extend(list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)))
-
+        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+        encoder_in_pos_embed = None  # RoPE will be applied in attention layers
         # Robot state token.
         if self.config.robot_state_feature:
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
@@ -504,36 +484,35 @@ class MACT(nn.Module):
             for cam_idx in range(n_cameras):
                 cam_img = batch[OBS_IMAGES][:, cam_idx]  # (B, C, H, W)
                 cam_features = self.backbone(cam_img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
                 # Rearrange features to (sequence, batch, dim).
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
                 # Extend immediately instead of accumulating and concatenating
                 # Convert to list to extend properly
                 encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        encoder_in_pos_embed = None  # RoPE will be applied in attention layers
 
         # Forward pass through the transformer modules.
-        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed, rope=self.encoder_rope)
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
-            dtype=encoder_in_pos_embed.dtype,
-            device=encoder_in_pos_embed.device,
+            dtype=encoder_in_tokens.dtype,
+            device=encoder_in_tokens.device,
         )
-        # Standard decoder cross-attention with encoder outputs (which now include history tokens)
+        # Pass history conditioning to decoder
+        history_cond = batch[HISTORY_TOKEN]
         decoder_out = self.decoder(
             decoder_in,
             encoder_out,
+            history_cond=history_cond,
             decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
-            encoder_pos_embed=encoder_in_pos_embed,
+            rope=self.encoder_rope,
         )
 
         # Move back to (B, S, C).
@@ -544,6 +523,198 @@ class MACT(nn.Module):
         return actions, (mu, log_sigma_x2)
 
 
+class MACTEncoder(nn.Module):
+    """Convenience module for running multiple encoder layers, maybe followed by normalization."""
+
+    def __init__(self, config: MACTConfig, is_vae_encoder: bool = False):
+        super().__init__()
+        self.is_vae_encoder = is_vae_encoder
+        num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
+        self.layers = nn.ModuleList([MACTEncoderLayer(config) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
+
+    def forward(
+        self, x: Tensor, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None, rope: RotaryEmbedding | None = None
+    ) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, pos_embed=pos_embed, key_padding_mask=key_padding_mask, rope=rope)
+        x = self.norm(x)
+        return x
+
+
+class MACTEncoderLayer(nn.Module):
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        self.self_attn = RoPEMultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+
+        # Feed forward layers.
+        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
+
+        self.norm1 = nn.LayerNorm(config.dim_model)
+        self.norm2 = nn.LayerNorm(config.dim_model)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+
+        self.activation = get_activation_fn(config.feedforward_activation)
+        self.pre_norm = config.pre_norm
+
+    def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None, rope: RotaryEmbedding | None = None) -> Tensor:
+        skip = x
+        if self.pre_norm:
+            x = self.norm1(x)
+        # Optionally add absolute positional embeddings before attention (for compatibility)
+        qkv = x if pos_embed is None else x + pos_embed
+
+        # RoPE will be applied inside self_attn after Q/K projection
+        x = self.self_attn(qkv, qkv, value=x, rope=rope, key_padding_mask=key_padding_mask)
+        x = x[0]  # note: [0] to select just the output, not the attention weights
+        x = skip + self.dropout1(x)
+        if self.pre_norm:
+            skip = x
+            x = self.norm2(x)
+        else:
+            x = self.norm1(x)
+            skip = x
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = skip + self.dropout2(x)
+        if not self.pre_norm:
+            x = self.norm2(x)
+        return x
+
+
+class MACTDecoder(nn.Module):
+    def __init__(self, config: MACTConfig):
+        """Convenience module for running multiple decoder layers followed by normalization."""
+        super().__init__()
+        self.layers = nn.ModuleList([MACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
+        self.norm = nn.LayerNorm(config.dim_model)
+
+    def forward(
+        self,
+        x: Tensor,
+        encoder_out: Tensor,
+        history_cond: Tensor,
+        decoder_pos_embed: Tensor | None = None,
+        rope: RotaryEmbedding | None = None,
+    ) -> Tensor:
+        for layer in self.layers:
+            x = layer(
+                x, encoder_out,
+                history_cond=history_cond,
+                decoder_pos_embed=decoder_pos_embed,
+                rope=rope,
+            )
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
+
+class MACTDecoderLayer(nn.Module):
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        self.self_attn = RoPEMultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+        self.multihead_attn = RoPEMultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+        self.history_attn = RoPEMultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+
+        # Feed forward layers.
+        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
+
+        self.norm1 = nn.LayerNorm(config.dim_model)
+        self.norm2 = nn.LayerNorm(config.dim_model)
+        self.norm3 = nn.LayerNorm(config.dim_model)
+        self.norm4 = nn.LayerNorm(config.dim_model)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+        self.dropout3 = nn.Dropout(config.dropout)
+        self.dropout4 = nn.Dropout(config.dropout)
+        self.activation = get_activation_fn(config.feedforward_activation)
+        self.pre_norm = config.pre_norm
+
+    def maybe_add_pos_embed(self, tensor: Tensor, pos_embed: Tensor | None) -> Tensor:
+        return tensor if pos_embed is None else tensor + pos_embed
+
+    def forward(
+        self,
+        x: Tensor,
+        encoder_out: Tensor,
+        history_cond: Tensor,
+        decoder_pos_embed: Tensor | None = None,
+        rope: RotaryEmbedding | None = None,
+    ) -> Tensor:
+        """
+        Args:
+            x: (Decoder Sequence, Batch, Channel) tensor of input tokens.
+            encoder_out: (Encoder Sequence, B, C) output features from the last layer of the encoder we are
+                cross-attending with.
+            decoder_pos_embed: (DS, 1, C) positional embedding for the queries (from the decoder) - DETR object queries.
+            rope: RotaryEmbedding for positional information.
+        Returns:
+            (DS, B, C) tensor of decoder output features.
+        """
+        skip = x
+        if self.pre_norm:
+            x = self.norm1(x)
+        qk = self.maybe_add_pos_embed(x, decoder_pos_embed)
+
+        # Decoder self-attention: RoPE applied inside self_attn after Q/K projection
+        x = self.self_attn(qk, qk, value=x, rope=rope)[0]  # select just the output, not the attention weights
+        x = skip + self.dropout1(x)
+        if self.pre_norm:
+            skip = x
+            x = self.norm2(x)
+        else:
+            x = self.norm1(x)
+            skip = x
+        query = self.maybe_add_pos_embed(x, decoder_pos_embed)
+        # Note: encoder_pos_embed removed since RoPE handles positional information
+        key = encoder_out
+
+        # Cross-attention with encoder: RoPE applied inside multihead_attn after Q/K projection
+        # RoPE handles positional information for both query and key
+        x = self.multihead_attn(
+            query=query,
+            key=key,
+            value=encoder_out,
+            rope=rope,
+        )[0]  # select just the output, not the attention weights
+        x = skip + self.dropout2(x)
+
+        # Cross-attention to history conditioning
+        if self.pre_norm:
+            skip = x
+            x = self.norm3(x)
+        else:
+            x = self.norm2(x)
+            skip = x
+        # Reshape history_cond from (B, n_tokens, D) to (n_tokens, B, D) for attention
+        history_cond = history_cond.transpose(0, 1)
+
+        # History cross-attention: RoPE applied inside history_attn after Q/K projection
+        # Both Q and K get rotated with their respective positions
+        x = self.history_attn(
+            query=x,  # (chunk_size, B, D)
+            key=history_cond,  # (n_tokens, B, D)
+            value=history_cond,  # (n_tokens, B, D)
+            rope=rope,
+        )[0]
+        x = skip + self.dropout3(x)
+        # Feed-forward (with history conditioning - norm3 used)
+        if self.pre_norm:
+            skip = x
+            x = self.norm4(x)
+        else:
+            x = self.norm3(x)
+            skip = x
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = skip + self.dropout4(x)
+        if not self.pre_norm:
+            x = self.norm4(x)
+
+        return x
 
 
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:

@@ -1,5 +1,6 @@
 from collections import deque
 from itertools import chain
+from pathlib import Path
 from typing import Any
 
 import einops
@@ -12,10 +13,9 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.modeling_act import (
-    ACTDecoder,
-    ACTEncoder,
     ACTSinusoidalPositionEmbedding2d,
     ACTTemporalEnsembler,
+    get_activation_fn,
 )
 from lerobot.policies.dact.configuration_mact import MACTConfig
 from lerobot.policies.dact.mamba2 import CrossCameraAttention, CrossModalAttention, Mamba2, Mamba2Config
@@ -29,6 +29,28 @@ class MACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
     Hardware (paper: https://huggingface.co/papers/2304.13705, code: https://github.com/tonyzhaozh/act)
+
+    Attention Visualization:
+    This policy supports capturing and visualizing multiple types of attention patterns during evaluation:
+
+    1. **Decoder History Attention**: How action positions attend to historical time steps
+    2. **Encoder-History Cross-Attention**: How individual encoder outputs (latent, state, image patches)
+       attend to history tokens
+
+    To enable attention capture:
+    1. Set `capture_attention_weights=True` in MACTConfig
+    2. Run evaluation episodes - attention weights are automatically accumulated
+    3. Call `policy.generate_attention_heatmap(episode_id)` to create visualizations
+
+    Generated visualizations are automatically saved to `outputs/attention_visualizations/`:
+    - `episode_attention_{episode_id}.png`: Overview of all attention types
+    - `episode_attention_{episode_id}_detailed.png`: Detailed encoder→history attention with labeled tokens
+    - Analysis reports with quantitative metrics (entropy, sparsity, temporal focus)
+
+    The attention patterns reveal:
+    - How the model leverages temporal history for action prediction
+    - Which encoder components (vision, state, latent) are most relevant at different times
+    - How attention patterns evolve throughout episodes
     """
 
     config_class = MACTConfig
@@ -55,6 +77,12 @@ class MACTPolicy(PreTrainedPolicy):
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
+
+        # Attention visualization
+        self.episode_attention_history = []
+
+        # Accumulate history tokens for attention visualization during inference
+        self._history_tokens_buffer = []
 
         self.reset()
 
@@ -92,7 +120,142 @@ class MACTPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque[Any](maxlen=self.config.n_obs_steps)
         self._mamba_cache = None
+        self.reset_episode_attention()
+        self._history_tokens_buffer = []
 
+    def accumulate_attention_weights(self, attn_weights):
+        """Accumulate attention weights for episode-level visualization."""
+        if attn_weights is not None:
+            # Ensure the list is initialized
+            if self.episode_attention_history is None:
+                self.episode_attention_history = []
+            self.episode_attention_history.append(attn_weights)
+
+    def generate_attention_heatmap(self, episode_id: str | None = None):
+        """Generate attention visualization video for the entire episode to outputs/attention_visualizations/."""
+        import matplotlib.pyplot as plt
+        import shutil
+        import tempfile
+
+        from lerobot.datasets.video_utils import encode_video_frames
+
+        from .attention_visualization import plot_single_timestep_attention
+
+        # Create fixed save directory in outputs folder
+        base_dir = Path("outputs") / "attention_visualizations"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use episode_id if provided, otherwise use timestamp
+        if episode_id is None:
+            from datetime import datetime
+            episode_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Check if we have attention data (handle case where it's None)
+        if self.episode_attention_history is None or not self.episode_attention_history:
+            print("No attention data available for visualization")
+            return None
+
+        print(f"Generating attention video for episode {episode_id} with {len(self.episode_attention_history)} timesteps")
+
+        # Create temporary directory for frames
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            frames_dir = temp_path / "frames"
+            frames_dir.mkdir()
+
+            # Generate a frame for each timestep
+            frame_paths = []
+            for t, attn_dict in enumerate(self.episode_attention_history):
+                frame_path = frames_dir / f"frame-{t:06d}.png"
+
+                # Generate attention heatmap for this single timestep using the new function
+                fig = plot_single_timestep_attention(
+                    attn_dict,  # Single timestep dictionary
+                    str(frame_path)
+                )
+
+                if fig is not None:
+                    frame_paths.append(frame_path)
+                    plt.close(fig)  # Close to free memory
+                else:
+                    print(f"Warning: Failed to generate frame for timestep {t}")
+
+            # Create MP4 video from frames
+            if frame_paths:
+                video_path = base_dir / f"episode_attention_{episode_id}.mp4"
+
+                # Assume 5 FPS for the attention video (slower for better viewing)
+                fps = 5
+
+                try:
+                    encode_video_frames(
+                        imgs_dir=str(frames_dir),
+                        video_path=str(video_path),
+                        fps=fps,
+                        vcodec="h264",  # Use H.264 for better compatibility
+                        overwrite=True
+                    )
+                    print(f"Attention video saved to: {video_path}")
+                    print(f"Video duration: {len(frame_paths)/fps:.1f} seconds at {fps} FPS")
+
+                except Exception as e:
+                    print(f"Failed to encode video: {e}")
+                    # Fallback: save individual frames
+                    fallback_dir = base_dir / f"episode_attention_{episode_id}_frames"
+                    fallback_dir.mkdir(exist_ok=True)
+                    for i, frame_path in enumerate(frame_paths):
+                        shutil.copy(frame_path, fallback_dir / f"timestep_{i:04d}.png")
+                    print(f"Fallback: Frames saved to {fallback_dir}")
+            else:
+                print("No frames were generated")
+
+        # Also generate static summary heatmap (using final timestep with most history)
+        summary_path = base_dir / f"episode_attention_{episode_id}_summary.png"
+        # Use only the last timestep which has the most complete history
+        final_timestep_data = [self.episode_attention_history[-1]] if self.episode_attention_history and len(self.episode_attention_history) > 0 else []
+        fig = plot_single_timestep_attention(
+            final_timestep_data[0] if final_timestep_data else {},
+            str(summary_path)
+        )
+
+        if fig is not None:
+            print(f"Summary heatmap saved to: {summary_path}")
+            return fig
+        else:
+            print("Failed to generate summary heatmap")
+            return None
+
+    def _get_encoder_token_labels(self) -> list[str]:
+        """Generate descriptive labels for encoder tokens."""
+        labels = []
+
+        # Latent token (always first)
+        labels.append("latent")
+
+        # Robot state token
+        if self.config.robot_state_feature:
+            labels.append("robot_state")
+
+        # Environment state token
+        if self.config.env_state_feature:
+            labels.append("env_state")
+
+        # Image feature patches
+        if self.config.image_features:
+            n_cameras = len(self.config.image_features)
+            # Note: This is an approximation - actual number depends on backbone output
+            # Each camera produces multiple patches (e.g., 7x7=49 for ResNet with 224x224 input)
+            # For simplicity, we'll just label them by camera
+            for cam_idx in range(n_cameras):
+                # This would need to be adjusted based on actual backbone output dimensions
+                # For now, just label by camera index
+                labels.append(f"cam_{cam_idx}")
+
+        return labels
+
+    def reset_episode_attention(self):
+        """Reset attention accumulation for a new episode."""
+        self.episode_attention_history = []
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -114,14 +277,17 @@ class MACTPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch)
 
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
+            actions, attn_weights = self.predict_action_chunk(batch)
+            self.accumulate_attention_weights(attn_weights)
             action = self.temporal_ensembler.update(actions)
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions, attn_weights = self.predict_action_chunk(batch)
+            self.accumulate_attention_weights(attn_weights)
+            actions = actions[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -160,13 +326,20 @@ class MACTPolicy(PreTrainedPolicy):
         # Update history encoder state and get history token
         h_t, self._mamba_cache = self.history_encoder.step(x_t, self._mamba_cache)
         h_t = h_t.detach()
-        # For inference, we only have the current timestep, so unsqueeze to match (B, 1, D)
-        model_batch[HISTORY_TOKEN] = h_t.unsqueeze(1)  # (B, 1, D)
+
+        # Accumulate history tokens for attention visualization
+        self._history_tokens_buffer.append(h_t)
+        if len(self._history_tokens_buffer) > self.config.n_history_tokens:
+            self._history_tokens_buffer.pop(0)
+
+        # Use accumulated history tokens (up to n_history_tokens)
+        history_tokens = torch.stack(self._history_tokens_buffer, dim=1)  # (B, n_history, D)
+        model_batch[HISTORY_TOKEN] = history_tokens
 
         # Get action predictions from model
-        actions = self.model(model_batch)[0]
+        actions, _, attn_weights = self.model(model_batch)
 
-        return actions
+        return actions, attn_weights
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -214,7 +387,7 @@ class MACTPolicy(PreTrainedPolicy):
             if "action_is_pad" in batch:
                 model_batch["action_is_pad"] = batch["action_is_pad"]
 
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(model_batch)
+        actions_hat, (mu_hat, log_sigma_x2_hat), _ = self.model(model_batch)
 
         # Compute loss using the last timestep's action
         l1_loss = (
@@ -280,7 +453,7 @@ class MACT(nn.Module):
         self.config = config
 
         if self.config.use_vae:
-            self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
+            self.vae_encoder = MACTEncoder(config, is_vae_encoder=True)
             self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
             # Projection layer for joint-space configuration to hidden dimension.
             if self.config.robot_state_feature:
@@ -317,11 +490,11 @@ class MACT(nn.Module):
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # Transformer (acts as VAE decoder when training with the variational objective).
-        self.encoder = ACTEncoder(config)
-        self.decoder = ACTDecoder(config)
+        self.encoder = MACTEncoder(config)
+        self.decoder = MACTDecoder(config)
 
         # Transformer encoder input projections. The tokens will be structured like
-        # [history_tokens, latent, (robot_state), (env_state), (image_feature_map_pixels)].
+        # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
                 self.config.robot_state_feature.shape[0], config.dim_model
@@ -341,7 +514,6 @@ class MACT(nn.Module):
             n_1d_tokens += 1
         if self.config.env_state_feature:
             n_1d_tokens += 1
-        # Note: history tokens get their own separate positional embeddings
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
@@ -350,7 +522,7 @@ class MACT(nn.Module):
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
-        # Positional embeddings for history tokens (used as encoder inputs)
+        # Positional embeddings for history tokens (used when concatenating with encoder outputs)
         self.history_pos_embed = nn.Embedding(config.n_history_tokens, config.dim_model)
 
         # Final action regression head on the output of the transformer's decoder.
@@ -364,7 +536,38 @@ class MACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def compute_encoder_history_attention(self, encoder_out: Tensor, history_tokens: Tensor) -> Tensor:
+        """
+        Compute cross-attention between encoder outputs and history tokens.
+
+        Args:
+            encoder_out: (seq_len, batch, dim) encoder output tokens
+            history_tokens: (batch, n_history, dim) history tokens
+
+        Returns:
+            (batch, encoder_seq_len, n_history) attention weights
+        """
+        _batch_size = encoder_out.shape[1]
+        _n_history = history_tokens.shape[1]
+        dim = encoder_out.shape[2]
+
+        # Treat encoder outputs as queries, history tokens as keys/values
+        # encoder_out: (seq_len, batch, dim) -> (batch, seq_len, dim) for attention
+        queries = encoder_out.transpose(0, 1)  # (batch, seq_len, dim)
+
+        # history_tokens: (batch, n_history, dim) - already in correct shape
+        keys = history_tokens  # (batch, n_history, dim)
+        _values = history_tokens  # (batch, n_history, dim)
+
+        # Compute attention scores: (batch, seq_len, n_history)
+        scores = torch.matmul(queries, keys.transpose(-2, -1)) / (dim ** 0.5)
+
+        # Apply softmax to get attention weights
+        attn_weights = F.softmax(scores, dim=-1)
+
+        return attn_weights.detach()  # (batch, seq_len, n_history)
+
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], dict | None]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -382,6 +585,7 @@ class MACT(nn.Module):
             (B, chunk_size, action_dim) batch of action sequences
             Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
             latent dimension.
+            Dictionary of attention weights if capture_attention_weights is enabled, None otherwise.
         """
         if self.config.use_vae and self.training:
             assert ACTION in batch, (
@@ -471,23 +675,8 @@ class MACT(nn.Module):
             )
 
         # Prepare transformer encoder inputs.
-        # Start with history tokens
-        history_cond = batch[HISTORY_TOKEN]  # (B, n_tokens, D)
-        n_tokens = history_cond.shape[1]
-        history_cond_seq = history_cond.transpose(0, 1)  # (n_tokens, B, D)
-
-        encoder_in_tokens = []
-        encoder_in_pos_embed = []
-
-        # Add history tokens and their positional embeddings
-        for i in range(n_tokens):
-            encoder_in_tokens.append(history_cond_seq[i])
-            encoder_in_pos_embed.append(self.history_pos_embed.weight[-n_tokens + i].unsqueeze(0))
-
-        # Add latent token
-        encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample))
-        encoder_in_pos_embed.extend(list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)))
-
+        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
         # Robot state token.
         if self.config.robot_state_feature:
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
@@ -528,12 +717,20 @@ class MACT(nn.Module):
             dtype=encoder_in_pos_embed.dtype,
             device=encoder_in_pos_embed.device,
         )
-        # Standard decoder cross-attention with encoder outputs (which now include history tokens)
+        # Pass history conditioning to decoder
+        history_cond = batch[HISTORY_TOKEN]  # (B, n_tokens, D)
+        # Create positional embeddings for history tokens
+        # Use the last n_tokens embeddings since we extract the last n_tokens from the sequence
+        # This assigns higher positional values to more recent tokens (standard transformer convention)
+        n_tokens = history_cond.shape[1]
+        history_pos_embed = self.history_pos_embed.weight[-n_tokens:].unsqueeze(1)  # (n_tokens, 1, D)
         decoder_out = self.decoder(
             decoder_in,
             encoder_out,
-            decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+            history_cond=history_cond,
             encoder_pos_embed=encoder_in_pos_embed,
+            history_pos_embed=history_pos_embed,
+            decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
         )
 
         # Move back to (B, S, C).
@@ -541,9 +738,212 @@ class MACT(nn.Module):
 
         actions = self.action_head(decoder_out)
 
-        return actions, (mu, log_sigma_x2)
+        # Collect attention weights if enabled
+        attn_weights = None
+        attn_weights = {}
+
+        # Include feature information for proper visualization
+        attn_weights['robot_state_present'] = self.config.robot_state_feature is not None
+        attn_weights['env_state_present'] = self.config.env_state_feature is not None
+        attn_weights['n_image_features'] = len(self.config.image_features) if self.config.image_features else 0
+        attn_weights['n_history_tokens'] = self.config.n_history_tokens
+
+        # Only collect attention from the final decoder layer (most relevant for output)
+        final_layer = self.decoder.layers[-1]
+        if hasattr(final_layer, '_last_encoder_attn_weights'):
+            # Split the combined attention weights into encoder and history portions
+            combined_attn = final_layer._last_encoder_attn_weights  # (B, query_len, key_len)
+            encoder_seq_len = encoder_out.shape[0]  # Number of encoder tokens
+
+            # Split attention: first encoder_seq_len tokens are encoder, rest are history
+            attn_weights['decoder_encoder_attn'] = combined_attn[:, :, :encoder_seq_len]
+            attn_weights['decoder_history_attn'] = combined_attn[:, :, encoder_seq_len:]
+
+        # Compute cross-attention between encoder outputs and history tokens
+        encoder_history_attn = self.compute_encoder_history_attention(
+            encoder_out, batch[HISTORY_TOKEN]
+        )
+        attn_weights['encoder_history_cross_attn'] = encoder_history_attn
+
+        return actions, (mu, log_sigma_x2), attn_weights
 
 
+class MACTEncoder(nn.Module):
+    """Convenience module for running multiple encoder layers, maybe followed by normalization."""
+
+    def __init__(self, config: MACTConfig, is_vae_encoder: bool = False):
+        super().__init__()
+        self.is_vae_encoder = is_vae_encoder
+        num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
+        self.layers = nn.ModuleList([MACTEncoderLayer(config) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
+
+    def forward(
+        self, x: Tensor, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None
+    ) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, pos_embed=pos_embed, key_padding_mask=key_padding_mask)
+        x = self.norm(x)
+        return x
+
+
+class MACTEncoderLayer(nn.Module):
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+
+        # Feed forward layers.
+        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
+
+        self.norm1 = nn.LayerNorm(config.dim_model)
+        self.norm2 = nn.LayerNorm(config.dim_model)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+
+        self.activation = get_activation_fn(config.feedforward_activation)
+        self.pre_norm = config.pre_norm
+
+    def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
+        skip = x
+        if self.pre_norm:
+            x = self.norm1(x)
+        q = k = x if pos_embed is None else x + pos_embed
+        x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask)
+        x = x[0]  # note: [0] to select just the output, not the attention weights
+        x = skip + self.dropout1(x)
+        if self.pre_norm:
+            skip = x
+            x = self.norm2(x)
+        else:
+            x = self.norm1(x)
+            skip = x
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = skip + self.dropout2(x)
+        if not self.pre_norm:
+            x = self.norm2(x)
+        return x
+
+
+class MACTDecoder(nn.Module):
+    def __init__(self, config: MACTConfig):
+        """Convenience module for running multiple decoder layers followed by normalization."""
+        super().__init__()
+        self.layers = nn.ModuleList([MACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
+        self.norm = nn.LayerNorm(config.dim_model)
+
+    def forward(
+        self,
+        x: Tensor,
+        encoder_out: Tensor,
+        history_cond: Tensor,
+        decoder_pos_embed: Tensor | None = None,
+        encoder_pos_embed: Tensor | None = None,
+        history_pos_embed: Tensor | None = None,
+    ) -> Tensor:
+        for layer in self.layers:
+            x = layer(
+                x, encoder_out,
+                history_cond=history_cond,
+                decoder_pos_embed=decoder_pos_embed,
+                encoder_pos_embed=encoder_pos_embed,
+                history_pos_embed=history_pos_embed,
+            )
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
+
+class MACTDecoderLayer(nn.Module):
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+
+        # Feed forward layers.
+        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
+
+        self.norm1 = nn.LayerNorm(config.dim_model)
+        self.norm2 = nn.LayerNorm(config.dim_model)
+        self.norm3 = nn.LayerNorm(config.dim_model)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
+        self.dropout3 = nn.Dropout(config.dropout)
+        self.activation = get_activation_fn(config.feedforward_activation)
+        self.pre_norm = config.pre_norm
+
+    def maybe_add_pos_embed(self, tensor: Tensor, pos_embed: Tensor | None) -> Tensor:
+        return tensor if pos_embed is None else tensor + pos_embed
+
+    def forward(
+        self,
+        x: Tensor,
+        encoder_out: Tensor,
+        history_cond: Tensor,
+        decoder_pos_embed: Tensor | None = None,
+        encoder_pos_embed: Tensor | None = None,
+        history_pos_embed: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Args:
+            x: (Decoder Sequence, Batch, Channel) tensor of input tokens.
+            encoder_out: (Encoder Sequence, B, C) output features from the last layer of the encoder we are
+                cross-attending with.
+            decoder_pos_embed: (DS, 1, C) positional embedding for the queries (from the decoder) - DETR object queries.
+            encoder_pos_embed: (ES, 1, C) positional embedding for keys (from the encoder).
+        Returns:
+            (DS, B, C) tensor of decoder output features.
+        """
+        skip = x
+        if self.pre_norm:
+            x = self.norm1(x)
+        q = k = self.maybe_add_pos_embed(x, decoder_pos_embed)
+        x = self.self_attn(q, k, value=x)[0]  # select just the output, not the attention weights
+        x = skip + self.dropout1(x)
+        if self.pre_norm:
+            skip = x
+            x = self.norm2(x)
+        else:
+            x = self.norm1(x)
+            skip = x
+
+        # Concatenate encoder outputs and history tokens for parallel attention
+        # Reshape history_cond from (B, n_tokens, D) to (n_tokens, B, D) for concatenation
+        history_cond_seq = history_cond.transpose(0, 1)  # (n_tokens, B, D)
+
+        # Concatenate along sequence dimension: (ES + n_tokens, B, C)
+        combined_keys = torch.cat([encoder_out, history_cond_seq], dim=0)
+        combined_values = combined_keys  # Use same values for both encoder and history
+
+        # Concatenate positional embeddings: (ES + n_tokens, 1, C)
+        combined_pos_embed = torch.cat([encoder_pos_embed, history_pos_embed], dim=0)
+
+        # Single cross-attention to both encoder outputs and history tokens
+        x, encoder_attn_weights = self.multihead_attn(
+            query=self.maybe_add_pos_embed(x, decoder_pos_embed),
+            key=self.maybe_add_pos_embed(combined_keys, combined_pos_embed),
+            value=combined_values,
+        )
+        # Store attention weights for later retrieval (shape: (B, L, S) where L is query length, S is key length)
+        self._last_encoder_attn_weights = encoder_attn_weights.detach()
+        x = skip + self.dropout2(x)
+
+        # Feed-forward
+        if self.pre_norm:
+            skip = x
+            x = self.norm3(x)
+        else:
+            x = self.norm2(x)
+            skip = x
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = skip + self.dropout3(x)
+        if not self.pre_norm:
+            x = self.norm3(x)
+
+        return x
 
 
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:

@@ -1,18 +1,3 @@
-#!/usr/bin/env python
-
-# Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -91,7 +76,7 @@ class MACTConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 4
+    n_obs_steps: int = 3
     chunk_size: int = 100
     n_action_steps: int = 100
 
@@ -109,7 +94,7 @@ class MACTConfig(PreTrainedConfig):
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
-    pre_norm: bool = False
+    pre_norm: bool = True
     dim_model: int = 512
     n_heads: int = 8
     dim_feedforward: int = 3200
@@ -138,13 +123,22 @@ class MACTConfig(PreTrainedConfig):
     optimizer_lr_backbone: float = 1e-5
 
     # History encoder.
+    use_history_encoder: bool = True # Legacy feature. TODO: Remove this.
     freeze_history_backbone: bool = False
-    use_history_encoder: bool = True
-    history_d_state: int = 2048
-    history_d_conv: int = 4
-    history_expand: int = 2
-    history_headdim: int = 128
     history_use_mem_eff_path: bool = True
+    history_use_mlp: bool = True  # Whether to include MLP in MambaBlocks
+    n_mamba2_layers: int = 1
+    n_history_tokens: int = 3  # Number of most recent history tokens used by the model
+
+    # Spatial adapter for camera features
+    spatial_adapter_hidden_dim: int = 512  # Hidden dimension in spatial adapter conv layers
+    spatial_adapter_output_dim: int = 256   # Output dimension before final projection
+    spatial_adapter_dropout: float = 0.1    # Dropout rate in spatial adapter
+
+    # RoPE.
+    # rope_partial_rotary_factor: float = 0.5
+    # rope_theta: float = 10000.0
+    capture_attention_weights: bool = True
 
     def __post_init__(self):
         super().__post_init__()

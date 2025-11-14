@@ -32,13 +32,45 @@ from huggingface_hub import PyTorchModelHubMixin
 from einops import rearrange, repeat
 from mamba_ssm.modules.block import Block
 from torchvision.transforms import functional as TF
-from lerobot.policies.dact.configuration_mact import MACTConfig
-from torch import Tensor
+
+# Add lerobot compatibility
+try:
+    from lerobot.configs.policies import PreTrainedConfig, PreTrainedPolicy
+    LEROBOT_AVAILABLE = True
+except ImportError:
+    LEROBOT_AVAILABLE = False
+    # Fallback config class
+    class PreTrainedConfig:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+        def _save_pretrained(self, save_directory):
+            pass
+        @classmethod
+        def from_pretrained(cls, pretrained_name_or_path, **kwargs):
+            return cls()
+
+    class PreTrainedPolicy(nn.Module):
+        def __init__(self, config=None):
+            super().__init__()
+            self.config = config
 
 # 0) MambaConfig
 #########################################
-class MambaConfig:
+class MambaConfig(PreTrainedConfig):
+    # Required for lerobot compatibility
+    name = "mamba_policy"
+
     def __init__(self):
+        super().__init__()
+
+        # Required lerobot config attributes
+        self.type = "mamba_policy"
+        self.repo_id = None
+        self.private = False
+        self.license = "apache-2.0"
+        self.tags = ["robotics", "lerobot", "mamba"]
+
         # 1) Mamba2
         self.d_model = 2048
         self.d_state = 512
@@ -57,6 +89,18 @@ class MambaConfig:
         self.mamba_conv_bias=True
         self.chunk_size=256
         self.use_mem_eff_path=True
+
+        # 2) Policy (多相机+lowdim)
+        self.camera_names = ['top'] # or whichever,'angle', etc
+        self.backbone=None
+        self.pretrained_backbone=True
+        self.freeze_backbone=True
+        self.embed_dim=2048       # each camera output
+        self.lowdim_dim=14       # state_dim
+        self.action_dim=14
+        self.sum_camera_feats=False
+        self.num_blocks=4
+        self.img_size=(640,480)
 
 #########################################
 # 1)  Mamba2
@@ -412,12 +456,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
 
 class CrossCameraAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, d_model=2048, num_heads=16):
         super().__init__()
-        d_model = config.dim_model
-        num_heads = config.n_heads
-            
-        self.multihead_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.multihead_attn = nn.MultiheadAttention(d_model, num_heads)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, query, key, value):
@@ -426,23 +467,355 @@ class CrossCameraAttention(nn.Module):
 
 
 class CrossModalAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, d_model=1024, num_heads=8, lowdim_dim=14):
         super().__init__()
-        d_model = config.dim_model
-        num_heads = config.n_heads
-        lowdim_dim = config.robot_state_feature.shape[0]
-            
+        # 层次化投影 + 非线性增强
         self.proj_lowdim = nn.Sequential(
-            nn.Linear(lowdim_dim, 128),
+            nn.Linear(14, 128),
             nn.GELU(),
             nn.Linear(128, 512),
             nn.Dropout(0.2),
-            nn.Linear(512, d_model)
+            nn.Linear(512, d_model)  # d_model=1536或2048
         )
-        self.multihead_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.multihead_attn = nn.MultiheadAttention(d_model, num_heads)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, query, key, value):
-        # Note: key and value are already projected outside this module
+        key = self.proj_lowdim(key)  # [B, 1, 14] → [B, 1, 1536(2048)]
+        value = self.proj_lowdim(value)
         attn_output, _ = self.multihead_attn(query, key, value)
         return self.norm(query + attn_output)
+
+
+# 动态适配DINOv2特征提取器
+class FrozenDinov2(nn.Module):
+    def __init__(self, patch_size=14, layer_index=-4):  # 取倒数第4层特征
+        super().__init__()
+        # 加载完整预训练模型
+        self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        self.patch_size = patch_size
+        self.layer_index = layer_index  # 控制特征提取层
+
+        # 冻结所有参数
+        for param in self.dino.parameters():
+            param.requires_grad_(False)
+        # 注册前向钩子获取中间层输出
+        self.feature_hook = self._register_hook()
+
+    def _register_hook(self):
+        # 获取完整的三维输出张量
+        def hook(module, input, output):
+            self.intermediate_output = output
+        handle = self.dino.blocks[self.layer_index].register_forward_hook(hook)
+        return handle
+
+    # adaptive_resize
+    def adaptive_resize(self, img, min_patches=8):
+        B, C, H, W = img.shape
+        min_size = self.patch_size * min_patches
+        scale = max(min_size / min(H, W), 1.0)  # 确保缩放比例≥1
+        new_H = max(round(H * scale), min_size)
+        new_W = max(round(W * scale), min_size)
+        # 强制对齐到patch_size的整数倍
+        new_H = ((new_H + self.patch_size - 1) // self.patch_size) * self.patch_size
+        new_W = ((new_W + self.patch_size - 1) // self.patch_size) * self.patch_size
+        return TF.resize(img, (new_H, new_W), antialias=True)
+
+    def forward(self, x):
+        # 动态调整尺寸（保证最小分辨率）
+        x = self.adaptive_resize(x)
+        B, C, H, W = x.shape
+
+        # 前向传播获取中间层特征
+        _ = self.dino(x)  # 触发前向钩子
+
+        # 获取中间层特征（shape: [B, num_patches, dim]）
+        features = self.intermediate_output
+
+        # 重组为2D特征图
+        H_patch = H // self.patch_size
+        W_patch = W // self.patch_size
+        features = features[:, 1:, :]  # 去除CLS token
+        features = features.permute(0, 2, 1).view(B, -1, H_patch, W_patch)
+        return features  # [B, dim, H_patch, W_patch]
+
+#########################################
+# 2) MambaPolicy (多相机 + lowdim -> Mamba2 -> action)
+#########################################
+import torch
+# import torch.nn as nn
+from torchvision import models
+
+class MambaPolicy(nn.Module if not LEROBOT_AVAILABLE else PreTrainedPolicy):
+    """
+    多相机 + lowdim -> backbone -> concat/sum -> in_proj -> Block (with Mamba2) -> action
+    """
+    # Required for lerobot compatibility
+    config_class = MambaConfig
+    name = "mamba_policy"
+    def __init__(
+        self,
+        config=None,
+        camera_names=None,
+        img_size=(640, 480),
+        embed_dim=2048,
+        lowdim_dim=14,
+        d_model=2048,
+        action_dim=14,
+        num_blocks=4,  # 支持多个 Block
+        sum_camera_feats=False,  # sum or concat
+        block_cfg=None,  # Block 的配置
+        mamba_cfg=None,  # Mamba2 的配置
+        future_steps=16,  # 预测未来16步，可调
+    ):
+        # Handle lerobot PreTrainedPolicy initialization
+        if LEROBOT_AVAILABLE and isinstance(config, PreTrainedConfig):
+            super().__init__(config)
+            # Extract parameters from config
+            camera_names = getattr(config, 'camera_names', camera_names)
+            img_size = getattr(config, 'img_size', img_size)
+            embed_dim = getattr(config, 'embed_dim', embed_dim)
+            lowdim_dim = getattr(config, 'lowdim_dim', lowdim_dim)
+            d_model = getattr(config, 'd_model', d_model)
+            action_dim = getattr(config, 'action_dim', action_dim)
+            num_blocks = getattr(config, 'num_blocks', num_blocks)
+            sum_camera_feats = getattr(config, 'sum_camera_feats', sum_camera_feats)
+            future_steps = getattr(config, 'future_steps', future_steps)
+            if hasattr(config, 'mamba_cfg'):
+                mamba_cfg = config.mamba_cfg
+        else:
+            super().__init__()
+        self.camera_names = camera_names
+        self.future_steps = future_steps
+        self.img_size = img_size
+        self.lowdim_dim = lowdim_dim
+        self.embed_dim = embed_dim
+        self.d_model = d_model
+        self.action_dim = action_dim
+        self.sum_camera_feats = sum_camera_feats
+        dinov2_dim = 1024  # dinov2_vitl14的dim=1024
+        if mamba_cfg is None or not isinstance(mamba_cfg, MambaConfig):
+            mamba_cfg = MambaConfig()
+        self.mamba_cfg = mamba_cfg
+        # 初始化DINOv2特征提取器
+        self.shared_backbone = FrozenDinov2(layer_index=-4)
+
+        # 添加空间压缩层（保持合理分辨率）
+        self.spatial_adapter = nn.Sequential(
+            nn.Conv2d(dinov2_dim, 512, 3, padding=1), #[B, 512, 45, 34]
+            nn.ReLU(),
+            nn.Conv2d(512, 256, 3, padding=1), #[B, 256, 45, 34]
+            nn.ReLU(),
+            nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),  # 输出 [B,128,22,17]
+            nn.Flatten(1), # [B, 128*(H*W)],输入为（640，480）时为（B, 128*23*18=52992）
+            nn.Linear(128*23*18, self.embed_dim),  # [B, embed_dim]
+            nn.LayerNorm(2048),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.10)
+        )
+        self.spatial_adpater_low = nn.Sequential(
+            nn.Conv2d(dinov2_dim, 512, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(512, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.Flatten(1),  # [B, 128*(H*W)],输入为（128，128）时为（B, 128*8*8=8192）
+            nn.Linear(128*8*8, self.embed_dim),  # [B, embed_dim],输入为（640，480）
+        )
+        # 输入特征的拼接和投影
+        # self.in_dim = embed_dim + lowdim_dim
+        self.cross_attn = CrossModalAttention(d_model)
+        self.in_dim = embed_dim * len(self.camera_names)
+        # 跨相机交叉注意力模块
+        self.num_cameras = len(camera_names)
+        if self.num_cameras > 1:
+            self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
+        self.in_proj = nn.Linear(self.in_dim, d_model)
+
+        # Block 配置
+        if block_cfg is None:
+            block_cfg = {}
+
+        # Mamba2 配置
+        def mixer_fn(dim):
+            return Mamba2(
+                d_model=dim,
+                d_state=self.mamba_cfg.d_state,
+                d_conv=self.mamba_cfg.d_conv,
+                expand=self.mamba_cfg.expand,
+                headdim=self.mamba_cfg.headdim,
+                ngroups=self.mamba_cfg.ngroups,
+                A_init_range=self.mamba_cfg.A_init_range,
+                dt_min=self.mamba_cfg.dt_min,
+                dt_max=self.mamba_cfg.dt_max,
+                dt_init_floor=self.mamba_cfg.dt_init_floor,
+                dt_limit=self.mamba_cfg.dt_limit,
+                chunk_size=self.mamba_cfg.chunk_size,
+                use_mem_eff_path=self.mamba_cfg.use_mem_eff_path,
+            )
+
+        def mlp_fn(dim):
+            hidden_dim = 4 * dim
+            return nn.Sequential(
+                nn.Linear(dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, dim),
+            )
+        # 构建多个 Block
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=self.d_model,
+                mixer_cls=mixer_fn,
+                mlp_cls=mlp_fn,
+                norm_cls=nn.LayerNorm,
+                fused_add_norm=block_cfg.get("fused_add_norm", False),
+                residual_in_fp32=block_cfg.get("residual_in_fp32", False),
+            )
+            for _ in range(num_blocks)
+        ])
+
+        self.flat_action_dim = action_dim * future_steps
+        self.out_proj = nn.Linear(d_model, self.flat_action_dim)
+
+
+    def init_hidden_states(self, batch_size, device=None):
+        """
+        For single-step inference: gather each block's Mamba2 => allocate_inference_cache
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        hidden_list = []
+        for blk in self.blocks:
+            if hasattr(blk.mixer, "allocate_inference_cache"):
+                conv_st, ssm_st = blk.mixer.allocate_inference_cache(batch_size, max_seqlen=1, dtype=None)
+            else:
+                conv_st, ssm_st = None, None
+            hidden_list.append((conv_st, ssm_st))
+        return hidden_list
+
+    def step(self, lowdim_t, images_t, hidden_states):
+        """
+        单帧前向:
+          lowdim_t: [B, lowdim_dim]
+          images_t: dict of [B, 3, H, W] => 单帧输入
+          hidden_states: list of (conv_st, ssm_st) per block，每个 Block 的隐藏状态
+        返回:
+          pred_action: [B, action_dim]
+          new_hidden_states: List[Tensor]
+        """
+        B, _ = lowdim_t.shape
+        device = lowdim_t.device
+
+        # 1. 多相机特征提取
+
+        feats_all = []
+        for cam in self.camera_names:
+            img = images_t[cam]
+            raw_feat = self.shared_backbone(img)  # [B, 1024, H_patch, W_patch]
+            # 空间压缩与通道调整
+            if self.img_size == (640, 480):
+                feat = self.spatial_adapter(raw_feat)  # [B, 128*11*8]
+            elif self.img_size == (128, 128):
+                feat = self.spatial_adapter_low(raw_feat) # [B, 128*8*8]
+            feats_all.append(feat)
+
+        cam_feats = torch.cat(feats_all, dim=1)
+        # 跨相机注意力
+        if self.num_cameras > 1:
+            cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
+                                            cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
+
+        # 2. 特征融合与投影
+        lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
+        # 投影到d_model并交叉注意力
+        cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
+        fused_feat = self.cross_attn(
+            query=cam_feats_proj.unsqueeze(1),
+            key=lowdim_feat,
+            value=lowdim_feat
+        ).squeeze(1)
+        x_t = fused_feat # [B, d_model]
+
+        # 3) 经过 blocks (单步)
+        residual = None
+        new_states = []
+        hidden = x_t
+        for i, blk in enumerate(self.blocks):
+            conv_st, ssm_st = hidden_states[i] if i < len(hidden_states) else (None, None)
+            if residual is None:
+                residual = hidden
+            else:
+                residual = residual + hidden
+
+            hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
+
+            # => step
+            # we need: out, new_conv, new_ssm = blk.mixer.step(...)
+            if hasattr(blk.mixer, "step"):
+                y_t, new_conv_st, new_ssm_st = blk.mixer.step(hidden_ln.unsqueeze(1), conv_st, ssm_st)
+                y_t = y_t.squeeze(1)   # => (B, d_model)
+            else:
+                # fallback
+                y_t = blk.mixer(hidden_ln.unsqueeze(1))
+                y_t = y_t.squeeze(1)
+                new_conv_st, new_ssm_st = conv_st, ssm_st
+
+            hidden_out = y_t + residual
+
+            # mlp
+            if blk.mlp is not None:
+                r2 = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
+                hidden_out = blk.mlp(r2) + hidden_out
+
+            new_states.append((new_conv_st, new_ssm_st))
+            hidden = hidden_out
+            residual = hidden_out
+
+            # d) out => action
+        action_flat = self.out_proj(hidden)# => [B, 16×14=224]
+        action_t = action_flat.view(-1, self.future_steps, 14)  # => [B,16,14]
+        return action_t, new_states
+
+# forward一般不使用
+    def forward(self, lowdim, images):
+        """
+        lowdim: [B, L, lowdim_dim]
+        images: dict of [B, L, 3, H, W]
+        返回: [B, L, action_dim]
+        """
+        device = lowdim.device
+        B, L, _ = lowdim.shape
+
+        # 1. 多相机特征提取
+        feats_all = []
+        for cam in self.camera_names:
+            if cam not in images:
+                feats_all.append(torch.zeros(B, L, self.embed_dim, device=device))
+                continue
+            x = images[cam]
+            x = x.view(B * L, *x.shape[2:])
+            net = self.backbones[cam]
+            feats = net(x)  # [B*L,512,15,20]
+            projected_feat = self.feature_extractors(feats)
+            projected_feat = projected_feat.view(B, L, -1)
+            feats_all.append(projected_feat)
+
+        if self.sum_camera_feats:
+            cam_feats = torch.stack(feats_all, dim=0).sum(dim=0)
+        else:
+            cam_feats = torch.cat(feats_all, dim=2)
+
+        # 2. 特征拼接与投影
+        x = torch.cat([cam_feats, lowdim], dim=2)
+        x = self.in_proj(x)
+
+        # 3. 逐层通过 Block
+        residual = None
+        for blk in self.blocks:
+            x, residual = blk(x, residual)
+
+        # 4. 输出动作
+        actions = self.out_proj(x)
+        actions = actions.view(B, L, self.future_steps, self.action_dim)
+        return actions
+

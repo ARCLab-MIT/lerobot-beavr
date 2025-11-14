@@ -389,6 +389,15 @@ def eval_policy(
                 threads.append(thread)
                 n_episodes_rendered += 1
 
+        # Generate attention heatmaps if policy supports it and attention capture is enabled
+        if hasattr(policy, 'generate_attention_heatmap') and hasattr(policy.config, 'capture_attention_weights') and policy.config.capture_attention_weights:
+            episode_id = f"batch_{batch_ix:03d}"
+            try:
+                policy.generate_attention_heatmap(episode_id)
+                logging.info(f"Generated attention heatmaps for {episode_id}")
+            except Exception as e:
+                logging.warning(f"Failed to generate attention heatmaps for {episode_id}: {e}")
+
         progbar.set_postfix(
             {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
         )
@@ -503,6 +512,11 @@ def eval_main(cfg: EvalPipelineConfig):
         env_cfg=cfg.env,
         rename_map=cfg.rename_map,
     )
+
+    # Enable attention capture for MACT policies if they support it
+    if hasattr(policy, 'config') and hasattr(policy.config, 'capture_attention_weights'):
+        policy.config.capture_attention_weights = True
+        logging.info("Enabled attention weight capture for MACT policy")
 
     policy.eval()
 
