@@ -29,7 +29,6 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.dact.configuration_dact_a import SACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -37,6 +36,7 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
+from lerobot.policies.sact.configuration_sact import SACTConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
@@ -110,7 +110,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         return GrootPolicy
 
     elif name == "sact":
-        from lerobot.policies.dact.modeling_dact_a import SACTPolicy
+        from lerobot.policies.sact.modeling_sact import SACTPolicy
 
         return SACTPolicy
     else:
@@ -127,7 +127,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
                      "diffusion", "act", "vqbet", "pi0", "pi05", "sac", "smolvla",
-                     "reward_classifier".
+                     "reward_classifier", "sact".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
     Returns:
@@ -158,6 +158,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return RewardClassifierConfig(**kwargs)
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
+    elif policy_type == "sact":
+        return SACTConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 
@@ -339,9 +341,9 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, SACTConfig):
-        from lerobot.policies.act.processor_act import make_act_pre_post_processors
+        from lerobot.policies.sact.processor_sact import make_sact_pre_post_processors
 
-        processors = make_act_pre_post_processors(
+        processors = make_sact_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

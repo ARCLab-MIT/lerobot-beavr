@@ -181,3 +181,5 @@ outputs/
 # Dataset
 # converted_datasets/
 # datasets/
+
+/lightning_logs/

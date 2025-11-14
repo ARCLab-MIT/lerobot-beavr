@@ -109,23 +109,31 @@ class SACTConfig(PreTrainedConfig):
     # pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     pretrained_backbone_weights: str | None = None
     replace_final_stride_with_dilation: int = True
+    # Patch-based tokenization for efficient attention
+    patch_size: tuple[int, int] = (4, 4)  # (height, width) patches for image tokenization
+    use_attention_pooling: bool = True  # Use attention pooling instead of average pooling for patches
+    # Refinement network for pixel-accurate predictions within patches
+    use_refinement: bool = True  # Enable refinement network for sub-pixel accuracy
+    refinement_patch_size: int = 16  # Size of patch extracted for refinement (pixels) - larger than patch_size for context
+    refinement_hidden_channels: int = 64  # Hidden channels in refinement network
+    refinement_weight: float = 1.0  # Weight for refinement loss in total loss
     # Transformer layers.loss
     pre_norm: bool = False
-    dim_model: int = 512
-    hidden_channels: int = 256
+    dim_model: int = 256
+    hidden_channels: int = 128
     input_channels: int = 3
-    n_heads: int = 8
-    dim_feedforward: int = 3200
+    n_heads: int = 4
+    dim_feedforward: int = 512
     feedforward_activation: str = "relu"
-    n_encoder_layers: int = 4
+    n_encoder_layers: int = 2
     # Note: Although the original ACT implementation has 7 for `n_decoder_layers`, there is a bug in the code
     # that means only the first layer is used. Here we match the original implementation by setting this to 1.
     # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
     n_decoder_layers: int = 1
     # VAE.
     use_vae: bool = True
-    latent_dim: int = 32
-    n_vae_encoder_layers: int = 4
+    latent_dim: int = 16
+    n_vae_encoder_layers: int = 2
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
@@ -133,11 +141,11 @@ class SACTConfig(PreTrainedConfig):
 
     # Training and loss computation.
     dropout: float = 0.1
-    ce_weight: float = 10.0
+    ce_weight: float = 1.0  # Weight for pixel loss (when refinement enabled) or CE loss (when disabled)
     kl_weight: float = 1.0
 
     # Training preset
-    optimizer_lr: float = 1e-5
+    optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 

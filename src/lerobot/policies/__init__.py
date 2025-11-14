@@ -13,11 +13,11 @@
 # limitations under the License.
 
 from .act.configuration_act import ACTConfig as ACTConfig
-from .dact.configuration_dact_a import SACTConfig as SACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .sact.configuration_sact import SACTConfig as SACTConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .smolvla.processor_smolvla import SmolVLANewLineProcessor
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
@@ -28,6 +28,7 @@ __all__ = [
     "DiffusionConfig",
     "PI0Config",
     "PI05Config",
+    "SACTConfig",
     "SmolVLAConfig",
     "TDMPCConfig",
     "VQBeTConfig",
