@@ -128,7 +128,7 @@ class MACTConfig(PreTrainedConfig):
     history_use_mem_eff_path: bool = True
     history_use_mlp: bool = True  # Whether to include MLP in MambaBlocks
     n_mamba2_layers: int = 1
-    n_history_tokens: int = 3  # Number of most recent history tokens used by the model
+    n_history_tokens: int = 1  # Number of most recent history tokens used by the model
 
     # Spatial adapter for camera features
     spatial_adapter_hidden_dim: int = 512  # Hidden dimension in spatial adapter conv layers

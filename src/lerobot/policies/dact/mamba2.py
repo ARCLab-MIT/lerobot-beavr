@@ -184,7 +184,14 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 sequence_parallel=config.sequence_parallel,
             )
 
-    def forward(self, u: Tensor, seqlen: int = None, seq_idx: Tensor = None, cu_seqlens: Tensor = None, inference_params: Any = None):
+    def forward(
+        self,
+        u: Tensor,
+        seqlen: int = None,
+        seq_idx: Tensor = None,
+        cu_seqlens: Tensor = None,
+        inference_params: Any = None
+    ):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we

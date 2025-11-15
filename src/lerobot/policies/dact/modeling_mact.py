@@ -544,8 +544,6 @@ class MACT(nn.Module):
         return actions, (mu, log_sigma_x2)
 
 
-
-
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:
     """1D sinusoidal positional embeddings as in Attention is All You Need.
 
