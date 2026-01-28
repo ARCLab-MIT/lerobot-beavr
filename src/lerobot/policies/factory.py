@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 import importlib
@@ -23,6 +22,7 @@ from typing import Any, TypedDict
 import torch
 from typing_extensions import Unpack
 
+from lerobot.policies.mact.configuration_mact import MACTConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -36,7 +36,9 @@ from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
-from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
+from lerobot.policies.sac.reward_model.configuration_classifier import (
+    RewardClassifierConfig,
+)
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
@@ -75,7 +77,11 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     Raises:
         NotImplementedError: If the policy name is not recognized.
     """
-    if name == "tdmpc":
+    if name == "mact":
+        from lerobot.policies.mact.modeling_mact import MACTPolicy
+
+        return MACTPolicy
+    elif name == "tdmpc":
         from lerobot.policies.tdmpc.modeling_tdmpc import TDMPCPolicy
 
         return TDMPCPolicy
@@ -157,7 +163,9 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     Raises:
         ValueError: If the `policy_type` is not recognized.
     """
-    if policy_type == "tdmpc":
+    if policy_type == "mact":
+        return MACTConfig(**kwargs)
+    elif policy_type == "tdmpc":
         return TDMPCConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
@@ -267,7 +275,8 @@ def make_pre_post_processors(
             PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,
                 config_filename=kwargs.get(
-                    "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+                    "preprocessor_config_filename",
+                    f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
                 ),
                 overrides=kwargs.get("preprocessor_overrides", {}),
                 to_transition=batch_to_transition,
@@ -276,7 +285,8 @@ def make_pre_post_processors(
             PolicyProcessorPipeline.from_pretrained(
                 pretrained_model_name_or_path=pretrained_path,
                 config_filename=kwargs.get(
-                    "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+                    "postprocessor_config_filename",
+                    f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
                 ),
                 overrides=kwargs.get("postprocessor_overrides", {}),
                 to_transition=policy_action_to_transition,
@@ -286,7 +296,9 @@ def make_pre_post_processors(
 
     # Create a new processor based on policy type
     if isinstance(policy_cfg, TDMPCConfig):
-        from lerobot.policies.tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
+        from lerobot.policies.tdmpc.processor_tdmpc import (
+            make_tdmpc_pre_post_processors,
+        )
 
         processors = make_tdmpc_pre_post_processors(
             config=policy_cfg,
@@ -294,9 +306,21 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, DiffusionConfig):
-        from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+        from lerobot.policies.diffusion.processor_diffusion import (
+            make_diffusion_pre_post_processors,
+        )
 
         processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, MACTConfig):
+        from lerobot.policies.mact.processor_mact import (
+            make_mact_pre_post_processors,
+        )
+
+        processors = make_mact_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
@@ -310,7 +334,9 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, VQBeTConfig):
-        from lerobot.policies.vqbet.processor_vqbet import make_vqbet_pre_post_processors
+        from lerobot.policies.vqbet.processor_vqbet import (
+            make_vqbet_pre_post_processors,
+        )
 
         processors = make_vqbet_pre_post_processors(
             config=policy_cfg,
@@ -342,7 +368,9 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, RewardClassifierConfig):
-        from lerobot.policies.sac.reward_model.processor_classifier import make_classifier_processor
+        from lerobot.policies.sac.reward_model.processor_classifier import (
+            make_classifier_processor,
+        )
 
         processors = make_classifier_processor(
             config=policy_cfg,
@@ -350,7 +378,9 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, SmolVLAConfig):
-        from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+        from lerobot.policies.smolvla.processor_smolvla import (
+            make_smolvla_pre_post_processors,
+        )
 
         processors = make_smolvla_pre_post_processors(
             config=policy_cfg,
@@ -366,7 +396,9 @@ def make_pre_post_processors(
             dataset_meta=kwargs.get("dataset_meta"),
         )
     elif isinstance(policy_cfg, GrootConfig):
-        from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+        from lerobot.policies.groot.processor_groot import (
+            make_groot_pre_post_processors,
+        )
 
         processors = make_groot_pre_post_processors(
             config=policy_cfg,
@@ -384,7 +416,9 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, WallXConfig):
-        from lerobot.policies.wall_x.processor_wall_x import make_wall_x_pre_post_processors
+        from lerobot.policies.wall_x.processor_wall_x import (
+            make_wall_x_pre_post_processors,
+        )
 
         processors = make_wall_x_pre_post_processors(
             config=policy_cfg,
@@ -398,7 +432,9 @@ def make_pre_post_processors(
                 dataset_stats=kwargs.get("dataset_stats"),
             )
         except Exception as e:
-            raise ValueError(f"Processor for policy type '{policy_cfg.type}' is not implemented.") from e
+            raise ValueError(
+                f"Processor for policy type '{policy_cfg.type}' is not implemented."
+            ) from e
 
     return processors
 
@@ -436,7 +472,9 @@ def make_policy(
                              combination (e.g., VQBeT with 'mps').
     """
     if bool(ds_meta) == bool(env_cfg):
-        raise ValueError("Either one of a dataset metadata or a sim env must be provided.")
+        raise ValueError(
+            "Either one of a dataset metadata or a sim env must be provided."
+        )
 
     # NOTE: Currently, if you try to run vqbet with mps backend, you'll get this error.
     # TODO(aliberts, rcadene): Implement a check_backend_compatibility in policies?
@@ -467,9 +505,13 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
-    cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    cfg.output_features = {
+        key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
+    }
     if not cfg.input_features:
-        cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+        cfg.input_features = {
+            key: ft for key, ft in features.items() if key not in cfg.output_features
+        }
     kwargs["config"] = cfg
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)
@@ -511,7 +553,9 @@ def make_policy(
             )
 
         policy = policy_cls.from_pretrained(**kwargs)
-        policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
+        policy = PeftModel.from_pretrained(
+            policy, peft_pretrained_path, config=peft_config
+        )
 
     else:
         # Make a fresh policy.
@@ -547,7 +591,9 @@ def _get_policy_cls_from_policy_name(name: str) -> type[PreTrainedConfig]:
     config_cls = PreTrainedConfig.get_choice_class(name)
     config_cls_name = config_cls.__name__
 
-    model_name = config_cls_name.removesuffix("Config")  # e.g., DiffusionConfig -> Diffusion
+    model_name = config_cls_name.removesuffix(
+        "Config"
+    )  # e.g., DiffusionConfig -> Diffusion
     if model_name == config_cls_name:
         raise ValueError(
             f"The config class name '{config_cls_name}' does not follow the expected naming convention."

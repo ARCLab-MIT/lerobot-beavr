@@ -76,9 +76,15 @@ dependencies = [
     "pyserial>=3.5,<4.0",
     "wandb>=0.24.0,<0.25.0",
 
-    "torch>=2.2.1,<2.8.0", # TODO: Bumb dependency
-    "torchcodec>=0.2.1,<0.6.0; sys_platform != 'win32' and (sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')) and (sys_platform != 'darwin' or platform_machine != 'x86_64')", # TODO: Bumb dependency
-    "torchvision>=0.21.0,<0.23.0", # TODO: Bumb dependency
+#Change: torch>=2.2.1,<2.8.0 To: torch>=2.2.1
+
+#Change: torchvision>=0.21.0,<0.23.0 To: torchvision>=0.21.0
+
+#Change: torchcodec>=0.2.1,<0.6.0 To: torchcodec>=0.2.1
+
+    "torch>=2.2.1", # TODO: Bumb dependency
+    "torchcodec>=0.2.1; sys_platform != 'win32' and (sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')) and (sys_platform != 'darwin' or platform_machine != 'x86_64')", # TODO: Bumb dependency
+    "torchvision>=0.21.0", # TODO: Bumb dependency
 
     "draccus==0.10.0", # TODO: Remove ==
     "gymnasium>=1.1.1,<2.0.0",

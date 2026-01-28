@@ -452,3 +452,10 @@ class IsaaclabArenaEnv(HubEnvConfig):
     @property
     def gym_kwargs(self) -> dict:
         return {}
+
+
+# Register beavr-bench environments if available
+try:
+    import beavr_bench  # noqa: F401
+except ImportError:
+    pass  # beavr-bench not installed

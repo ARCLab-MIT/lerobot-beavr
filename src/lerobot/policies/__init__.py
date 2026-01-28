@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .mact.configuration_mact import MACTConfig as MACTConfig
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
@@ -26,6 +27,7 @@ from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
 __all__ = [
+    "MACTConfig",
     "ACTConfig",
     "DiffusionConfig",
     "PI0Config",

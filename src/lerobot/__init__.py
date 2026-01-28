@@ -198,3 +198,9 @@ env_dataset_policy_triplets = [
     for dataset in datasets
     for policy in available_policies_per_env[env]
 ]
+
+# Register beavr-bench environments if available
+try:
+    import beavr_bench  # noqa: F401
+except ImportError:
+    pass  # beavr-bench not installed

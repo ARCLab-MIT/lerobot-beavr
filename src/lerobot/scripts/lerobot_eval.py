@@ -46,6 +46,12 @@ Note that in both examples, the repo/folder should contain at least `config.json
 You can learn about the CLI options for this script in the `EvalPipelineConfig` in lerobot/configs/eval.py
 """
 
+# Register beavr-bench environments if available (must be before lerobot imports)
+try:
+    import beavr_bench  # noqa: F401
+except ImportError:
+    pass  # beavr-bench not installed
+
 import concurrent.futures as cf
 import json
 import logging
