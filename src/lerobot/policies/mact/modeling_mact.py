@@ -11,6 +11,13 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+try:
+    import dinov2  # noqa: F401
+
+    DINOV2_AVAILABLE = True
+except ImportError:
+    DINOV2_AVAILABLE = False
+
 from lerobot.policies.act.modeling_act import (
     ACTDecoder,
     ACTEncoder,
@@ -20,7 +27,6 @@ from lerobot.policies.act.modeling_act import (
 from lerobot.policies.mact.configuration_mact import MACTConfig
 from lerobot.policies.mact.mamba2 import (
     CrossCameraAttention,
-    CrossModalAttention,
     Mamba2,
     Mamba2Config,
 )
@@ -62,9 +68,7 @@ class MACTPolicy(PreTrainedPolicy):
         self._queues = None
 
         if config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler = ACTTemporalEnsembler(
-                config.temporal_ensemble_coeff, config.chunk_size
-            )
+            self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
         self.reset()
 
@@ -104,6 +108,8 @@ class MACTPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque[Any](maxlen=self.config.n_obs_steps)
         self._mamba_cache = None
+        self._history_tokens = deque[Tensor](maxlen=self.config.n_history_tokens)
+        self._inference_step_counter = 0  # Track steps for stride-based history updates
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -119,12 +125,8 @@ class MACTPolicy(PreTrainedPolicy):
             batch.pop(ACTION)
 
         if self.config.image_features:
-            batch = dict[str, Tensor](
-                batch
-            )  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
-            )
+            batch = dict[str, Tensor](batch)  # shallow copy so that adding a key doesn't modify the original
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
@@ -156,9 +158,7 @@ class MACTPolicy(PreTrainedPolicy):
 
         # Stack images along camera dimension: (B, N_cam, C, H, W)
         if self.config.image_features:
-            model_batch[OBS_IMAGES] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
-            )
+            model_batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
 
         # Process through history encoder
         # Initialize cache on first call
@@ -167,17 +167,25 @@ class MACTPolicy(PreTrainedPolicy):
                 batch_size=model_batch[OBS_IMAGES].shape[0],
                 dtype=model_batch[OBS_IMAGES].dtype,
             )
+            self._strided_obs_idx = 0  # Track how many strided observations we've processed
 
-        # Fuse single timestep observation
-        x_t = self.history_encoder.fuse_one_timestep(
-            model_batch[OBS_IMAGES], model_batch.get(OBS_STATE, None)
-        )
+        # Only update history on stride boundaries (matches training)
+        if self._inference_step_counter % self.config.observation_stride == 0:
+            # Get pooled frame representation (pool BEFORE Mamba, matches training)
+            x_t = self.history_encoder.fuse_one_timestep(
+                model_batch[OBS_IMAGES],
+                timestep_idx=self._strided_obs_idx,
+            )  # (B, D)
+            # Process through Mamba (one step per frame, matches training)
+            h_t, self._mamba_cache = self.history_encoder.step(x_t, self._mamba_cache)
 
-        # Update history encoder state and get history token
-        h_t, self._mamba_cache = self.history_encoder.step(x_t, self._mamba_cache)
-        h_t = h_t.detach()
-        # For inference, we only have the current timestep, so unsqueeze to match (B, 1, D)
-        model_batch[HISTORY_TOKEN] = h_t.unsqueeze(1)  # (B, 1, D)
+            self._history_tokens.append(h_t.detach())
+            self._strided_obs_idx += 1
+
+        self._inference_step_counter += 1
+        history_tokens = list(self._history_tokens)
+        # Shape: (B, n_tokens, D)
+        model_batch[HISTORY_TOKEN] = torch.stack(history_tokens, dim=1)
 
         # Get action predictions from model
         actions = self.model(model_batch)[0]
@@ -193,9 +201,7 @@ class MACTPolicy(PreTrainedPolicy):
         # Stack images for model input if needed
         if self.config.image_features:
             # Stack images along camera dimension for model input: (B, L, N_cam, C, H, W)
-            batch[OBS_IMAGES] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
-            )
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
 
         # Prepare batch for history encoder
 
@@ -247,12 +253,7 @@ class MACTPolicy(PreTrainedPolicy):
             # KL-divergence per batch element, then take the mean over the batch.
             # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
             mean_kld = (
-                (
-                    -0.5
-                    * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())
-                )
-                .sum(-1)
-                .mean()
+                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
             loss = l1_loss + mean_kld * self.config.kl_weight
@@ -317,9 +318,7 @@ class MACT(nn.Module):
                 config.dim_model,
             )
             # Projection layer from the VAE encoder's output to the latent distribution's parameter space.
-            self.vae_encoder_latent_output_proj = nn.Linear(
-                config.dim_model, config.latent_dim * 2
-            )
+            self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
             # Fixed sinusoidal positional embedding for the input to the VAE encoder. Unsqueeze for batch
             # dimension.
             num_input_token_encoder = 1 + config.chunk_size
@@ -327,9 +326,7 @@ class MACT(nn.Module):
                 num_input_token_encoder += 1
             self.register_buffer(
                 "vae_encoder_pos_enc",
-                create_sinusoidal_pos_embedding(
-                    num_input_token_encoder, config.dim_model
-                ).unsqueeze(0),
+                create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
             )
 
         # Backbone for image feature extraction.
@@ -346,9 +343,7 @@ class MACT(nn.Module):
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(
-                backbone_model, return_layers={"layer4": "feature_map"}
-            )
+            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -378,9 +373,7 @@ class MACT(nn.Module):
         # Note: history tokens get their own separate positional embeddings
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
-            self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(
-                config.dim_model // 2
-            )
+            self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
         # Transformer decoder.
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
@@ -390,9 +383,7 @@ class MACT(nn.Module):
         self.history_pos_embed = nn.Embedding(config.n_history_tokens, config.dim_model)
 
         # Final action regression head on the output of the transformer's decoder.
-        self.action_head = nn.Linear(
-            config.dim_model, self.config.action_feature.shape[0]
-        )
+        self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
         self._reset_parameters()
 
@@ -402,9 +393,7 @@ class MACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(
-        self, batch: dict[str, Tensor]
-    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -445,9 +434,7 @@ class MACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(
-                    batch[OBS_STATE]
-                )
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
                 # Ensure robot_state_embed is (B, 1, D)
                 if robot_state_embed.dim() == 3:
                     robot_state_embed = robot_state_embed[:, -1:, :]  # (B, 1, D)
@@ -467,9 +454,7 @@ class MACT(nn.Module):
             else:
                 raise ValueError(f"Unexpected ACTION shape: {action_input.shape}")
 
-            action_embed = self.vae_encoder_action_input_proj(
-                action_input
-            )  # (B, chunk_size, D)
+            action_embed = self.vae_encoder_action_input_proj(action_input)  # (B, chunk_size, D)
 
             if self.config.robot_state_feature:
                 vae_encoder_input = [
@@ -514,9 +499,9 @@ class MACT(nn.Module):
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros(
-                [batch_size, self.config.latent_dim], dtype=torch.float32
-            ).to(batch[OBS_STATE].device)
+            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                batch[OBS_STATE].device
+            )
 
         # Prepare transformer encoder inputs.
         # Start with history tokens
@@ -530,26 +515,18 @@ class MACT(nn.Module):
         # Add history tokens and their positional embeddings
         for i in range(n_tokens):
             encoder_in_tokens.append(history_cond_seq[i])
-            encoder_in_pos_embed.append(
-                self.history_pos_embed.weight[-n_tokens + i].unsqueeze(0)
-            )
+            encoder_in_pos_embed.append(self.history_pos_embed.weight[-n_tokens + i].unsqueeze(0))
 
         # Add latent token
         encoder_in_tokens.append(self.encoder_latent_input_proj(latent_sample))
-        encoder_in_pos_embed.extend(
-            list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        )
+        encoder_in_pos_embed.extend(list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)))
 
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_robot_state_input_proj(batch[OBS_STATE])
-            )
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
         # Environment state token.
         if self.config.env_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_env_state_input_proj(batch[OBS_ENV_STATE])
-            )
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
         if self.config.image_features:
             # batch[OBS_IMAGES] has shape (B, N_cam, C, H, W)
@@ -560,9 +537,7 @@ class MACT(nn.Module):
             for cam_idx in range(n_cameras):
                 cam_img = batch[OBS_IMAGES][:, cam_idx]  # (B, C, H, W)
                 cam_features = self.backbone(cam_img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
-                    dtype=cam_features.dtype
-                )
+                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
                 # Rearrange features to (sequence, batch, dim).
@@ -612,17 +587,149 @@ def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tenso
     """
 
     def get_position_angle_vec(position):
-        return [
-            position / np.power(10000, 2 * (hid_j // 2) / dimension)
-            for hid_j in range(dimension)
-        ]
+        return [position / np.power(10000, 2 * (hid_j // 2) / dimension) for hid_j in range(dimension)]
 
-    sinusoid_table = np.array(
-        [get_position_angle_vec(pos_i) for pos_i in range(num_positions)]
-    )
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(num_positions)])
     sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
     return torch.from_numpy(sinusoid_table).float()
+
+
+class ImageEncoder(nn.Module):
+    """Base class for image encoders that extract features from images."""
+
+    def forward(self, images: Tensor) -> Tensor:
+        """Encode images to feature tokens.
+
+        Args:
+            images: (B, C, H, W) batch of images
+        Returns:
+            (B, num_tokens, D) feature tokens
+        """
+        raise NotImplementedError
+
+
+class ResNetImageEncoder(ImageEncoder):
+    """ResNet-based image encoder with spatial tokens."""
+
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        self.config = config
+        backbone_model = getattr(torchvision.models, config.vision_backbone)(
+            replace_stride_with_dilation=[
+                False,
+                False,
+                config.replace_final_stride_with_dilation,
+            ],
+            weights=config.pretrained_backbone_weights,
+            norm_layer=FrozenBatchNorm2d,
+        )
+        self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+
+        # Spatial adapter: preserve spatial features as 49 tokens (7x7 grid)
+        backbone_out_channels = backbone_model.fc.in_features
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(
+                backbone_out_channels,
+                config.spatial_adapter_hidden_dim,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.ReLU(),
+            nn.Conv2d(
+                config.spatial_adapter_hidden_dim,
+                config.dim_model,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.ReLU(),
+        )
+        # Per-token processing after flattening spatial dims
+        self.spatial_token_proj = nn.Sequential(
+            nn.Linear(config.dim_model, config.dim_model),
+            nn.LayerNorm(config.dim_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.spatial_adapter_dropout),
+        )
+
+        if config.freeze_history_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+    def forward(self, images: Tensor) -> Tensor:
+        """(B, C, H, W) -> (B, n_tokens, D) - all spatial tokens from 7x7 feature map."""
+        if self.config.freeze_history_backbone:
+            with torch.no_grad():
+                features = self.backbone(images)["feature_map"]  # (B, C, H, W)
+        else:
+            features = self.backbone(images)["feature_map"]  # (B, C, H, W)
+
+        # Apply conv layers
+        features = self.spatial_conv(features)  # (B, D, H, W)
+
+        # Flatten spatial dims to sequence: (B, D, H, W) -> (B, H*W, D)
+        features = einops.rearrange(features, "b d h w -> b (h w) d")
+
+        # Apply per-token projection
+        tokens = self.spatial_token_proj(features)  # (B, H*W, D)
+
+        return tokens
+
+
+class DinoV2ImageEncoder(ImageEncoder):
+    """DINOv2-based image encoder that preserves spatial patch tokens."""
+
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        self.config = config
+        if not DINOV2_AVAILABLE:
+            raise ImportError(
+                "DINOv2 is not available. Install with: pip install dinov2 or use torch.hub.load"
+            )
+
+        # Load DINOv2 model from torch hub
+        self.dinov2 = torch.hub.load("facebookresearch/dinov2", config.vision_backbone)
+
+        # Get embedding dimension based on model variant
+        dinov2_dims = {
+            "dinov2_vits14": 384,
+            "dinov2_vitb14": 768,
+            "dinov2_vitl14": 1024,
+            "dinov2_vitg14": 1536,
+        }
+        self.embed_dim = dinov2_dims.get(config.vision_backbone, 768)
+
+        # Project to model dimension if needed
+        if self.embed_dim != config.dim_model:
+            self.proj = nn.Linear(self.embed_dim, config.dim_model)
+        else:
+            self.proj = nn.Identity()
+
+        # Freeze backbone if requested
+        if config.freeze_history_backbone:
+            for param in self.dinov2.parameters():
+                param.requires_grad = False
+
+    def forward(self, images: Tensor) -> Tensor:
+        """(B, C, H, W) -> (B, num_patches, D) - all spatial patch tokens."""
+        # DINOv2 expects float images in [0, 1]
+        if images.dtype == torch.uint8:
+            images = images.float().div_(255)
+
+        # Get tokens from DINOv2: (B, num_patches+1, embed_dim)
+        if self.config.freeze_history_backbone:
+            with torch.no_grad():
+                tokens = self.dinov2.forward_features(images)
+        else:
+            tokens = self.dinov2.forward_features(images)
+
+        # Extract patch tokens (excluding CLS token at position 0)
+        patch_tokens = tokens["x_norm_patchtokens"] if isinstance(tokens, dict) else tokens[:, 1:]
+
+        # Project to model dimension
+        projected = self.proj(patch_tokens)  # (B, num_patches, D)
+
+        return projected
 
 
 class MambaBlock(nn.Module):
@@ -678,6 +785,36 @@ class MambaBlock(nn.Module):
         return out
 
 
+class SummaryAttention(nn.Module):
+    """Attention-based summarization of spatial tokens into a single frame representation.
+
+    Uses a learnable query token to attend over all spatial tokens and produce a summary.
+    """
+
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, config.dim_model) * (1 / np.sqrt(config.dim_model)))
+        self.attn = nn.MultiheadAttention(
+            config.dim_model,
+            num_heads=config.n_heads,
+            batch_first=True,
+            dropout=config.dropout,
+        )
+        self.norm = nn.LayerNorm(config.dim_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Summarize spatial tokens using attention.
+
+        Args:
+            x: (B, N_tokens, D) spatial tokens
+        Returns:
+            (B, D) summarized representation
+        """
+        query = self.query.expand(x.shape[0], -1, -1)  # (B, 1, D)
+        summary, _ = self.attn(query, x, x)  # (B, 1, D)
+        return self.norm(query + summary).squeeze(1)  # (B, D)
+
+
 class HistoryEncoder(nn.Module):
     """Recurrent history encoder based on stacked Mamba2 blocks.
 
@@ -687,136 +824,165 @@ class HistoryEncoder(nn.Module):
 
     def __init__(self, config: MACTConfig):
         super().__init__()
-        # Stack of Mamba2 blocks controlled by n_mamba2_layers config parameter
-        self.blocks = nn.ModuleList(
-            [MambaBlock(config, layer_idx=i) for i in range(config.n_mamba2_layers)]
-        )
-
-        self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(
-                config.dim_model,
-                config.spatial_adapter_hidden_dim,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                config.spatial_adapter_hidden_dim,
-                config.spatial_adapter_output_dim,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(1),
-            nn.Linear(config.spatial_adapter_output_dim, config.dim_model),  # (B, D)
-            nn.LayerNorm(config.dim_model),
-            nn.ReLU(inplace=True),
-            nn.Dropout(config.spatial_adapter_dropout),
-        )
-
         self.config = config
-        # Backbone for image feature extraction.
-        if self.config.image_features:
-            history_backbone_model = getattr(
-                torchvision.models, config.vision_backbone
-            )(
-                replace_stride_with_dilation=[
-                    False,
-                    False,
-                    config.replace_final_stride_with_dilation,
-                ],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.hist_backbone = IntermediateLayerGetter(
-                history_backbone_model, return_layers={"layer4": "feature_map"}
-            )
-            # Expose backbone output channels for consumers
-            self.hist_backbone_out_channels = history_backbone_model.fc.in_features
-            # self.hist_backbone = self.hist_backbone.to(memory_format=torch.channels_last)
 
-            # Freeze the history backbone parameters
-            if config.freeze_history_backbone:
-                for param in self.hist_backbone.parameters():
-                    param.requires_grad = False
+        # Stack of Mamba2 blocks controlled by n_mamba2_layers config parameter
+        self.blocks = nn.ModuleList([MambaBlock(config, layer_idx=i) for i in range(config.n_mamba2_layers)])
+
+        # Image encoder (ResNet or DINOv2)
+        if self.config.image_features:
+            if config.vision_backbone.startswith("dinov2"):
+                self.image_encoder = DinoV2ImageEncoder(config)
+            else:
+                self.image_encoder = ResNetImageEncoder(config)
 
         self.cross_camera_attn = self.cross_cam_attn = CrossCameraAttention(config)
-        self.cross_modal_attn = CrossModalAttention(config)
 
         self.encoder_history_input_proj = nn.Linear(config.dim_model, config.dim_model)
 
+        # Summary attention for pooling spatial tokens BEFORE Mamba
+        self.summary_attn = SummaryAttention(config)
+
+        # Temporal positional embeddings for frame-level Mamba
+        # Shape: (1, n_obs_steps, D) - one embedding per frame position
+        self.temporal_pos_embed = nn.Parameter(
+            torch.randn(1, config.n_obs_steps, config.dim_model) * (1 / np.sqrt(config.dim_model))
+        )
+
+    def _downsample_images(
+        self,
+        images: Tensor,
+        height: int,
+        width: int,
+    ) -> tuple[Tensor, int, int]:
+        """Downsample images for history encoder efficiency if configured.
+
+        Args:
+            images: Input images tensor. Can be:
+                - (B, L, N_cam, C, H, W) for training batch
+                - (B, N_cam, C, H, W) for single timestep inference
+            height: Current height of the images
+            width: Current width of the images
+
+        Returns:
+            Tuple of:
+                - Downsampled images tensor (same shape as input)
+                - New height
+                - New width
+        """
+        if self.config.history_image_size is None:
+            return images, height, width
+
+        target_h, target_w = self.config.history_image_size
+        if (height, width) == (target_h, target_w):
+            return images, height, width
+
+        # Store original shape to restore it after downsampling
+        original_shape = images.shape
+        num_dims = len(original_shape)
+
+        # Reshape to (N, C, H, W) for interpolation where N = batch_size * [seq_len] * num_cameras
+        if num_dims == 6:
+            # Training path: (B, L, N_cam, C, H, W)
+            batch_size, seq_len, num_cameras, channels = original_shape[:4]
+            images = images.reshape(batch_size * seq_len * num_cameras, channels, height, width)
+        elif num_dims == 5:
+            # Inference path: (B, N_cam, C, H, W)
+            batch_size, num_cameras, channels = original_shape[:3]
+            images = images.reshape(batch_size * num_cameras, channels, height, width)
+        else:
+            raise ValueError(f"Unexpected image tensor shape: {original_shape}")
+
+        # Downsample
+        images = F.interpolate(
+            images.float() if images.dtype == torch.uint8 else images,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # Reshape back to original structure with new spatial dimensions
+        if num_dims == 6:
+            images = images.reshape(batch_size, seq_len, num_cameras, channels, target_h, target_w)
+        elif num_dims == 5:
+            images = images.reshape(batch_size, num_cameras, channels, target_h, target_w)
+
+        return images, target_h, target_w
+
     @torch.no_grad()
-    def init_cache(
-        self, batch_size: int, dtype: torch.dtype
-    ) -> list[tuple[Tensor, Tensor]]:
+    def init_cache(self, batch_size: int, dtype: torch.dtype) -> list[tuple[Tensor, Tensor]]:
         # Return a list of caches - one for each Mamba2 block
         return [
-            block.mixer.allocate_inference_cache(batch_size=batch_size, dtype=dtype)
-            for block in self.blocks
+            block.mixer.allocate_inference_cache(batch_size=batch_size, dtype=dtype) for block in self.blocks
         ]
 
     @torch.no_grad()
     def step(
         self,
-        x_t: Tensor,  # (B, D)
+        x_t: Tensor,  # (B, D) - pooled frame representation
         cache: list[tuple[Tensor, Tensor]],
     ) -> tuple[Tensor, list[tuple[Tensor, Tensor]]]:
-        """Run one recurrent step through all Mamba2 blocks (inference only).
+        """Run one Mamba step for a pooled frame representation (inference).
+
+        This matches the training path exactly: pool BEFORE Mamba, one step per frame.
 
         Args:
-            x_t: (B, D)
+            x_t: (B, D) - pooled frame representation (spatial tokens already pooled)
             cache: list of (conv_state, ssm_state) tuples - one per block
         Returns:
-            h_t: (B, D) and updated cache list
+            h_t: (B, D) - processed frame representation and updated cache list
         """
-        residual = None
+        hidden = x_t  # (B, D)
         updated_cache = []
-        hidden = x_t
+        residual = None
 
         for i, block in enumerate(self.blocks):
             conv_state, ssm_state = cache[i]
 
-            # Accumulate residuals across blocks
-            residual = hidden if residual is None else residual + hidden
+            # Initialize or update residual (matches MambaBlock.forward exactly)
+            if residual is None:
+                residual = hidden
+            # Note: In MambaBlock.forward, residual is just assigned, not accumulated
 
-            # Pre-norm
+            # Pre-norm (matches MambaBlock.forward)
             hidden_norm = block.norm(residual.to(dtype=block.norm.weight.dtype))
 
-            # Mamba2 mixer step
-            y_t, new_conv, new_ssm = block.mixer.step(
-                hidden_norm.unsqueeze(1), conv_state, ssm_state
-            )
+            # Mamba2 mixer step - expects (B, 1, D) for single token
+            y_t, new_conv, new_ssm = block.mixer.step(hidden_norm.unsqueeze(1), conv_state, ssm_state)
             y_t = y_t.squeeze(1)  # (B, D)
 
-            # Residual connection
-            hidden_out = y_t + residual
+            # Residual connection (matches MambaBlock.forward: out = y + residual)
+            hidden = y_t + residual
 
-            # Optional MLP (if configured)
+            # Optional MLP (matches MambaBlock.forward exactly)
             if block.mlp is not None:
-                mlp_input = block.norm(hidden_out.to(dtype=block.norm.weight.dtype))
-                hidden_out = block.mlp(mlp_input) + hidden_out
+                hidden = block.mlp(block.norm(hidden)) + hidden
 
             updated_cache.append((new_conv, new_ssm))
-            hidden = hidden_out
-            residual = hidden_out
+            residual = hidden  # Update residual for next block
 
-        return hidden, updated_cache
+        h_t = hidden  # (B, D)
+
+        # Apply projection (matches training forward path)
+        h_t = self.encoder_history_input_proj(h_t)  # (B, D)
+
+        return h_t, updated_cache
 
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
         """Process a full sequence using fused Mamba2 forward (training).
+
+        Architecture: Pool spatial tokens BEFORE Mamba to ensure train-inference consistency.
+        Flow: images -> encode -> cross-camera attn -> pool per-frame -> temporal pos -> Mamba -> proj
 
         Args:
             batch: Full batch of observations and actions
         Returns:
             h_seq: (B, L, D) processed history features
         """
-        # Fuse observations into history vectors
+        # Get pooled frame representations
         x_seq = self.fuse_observations(batch)  # (B, L, D)
-        # Process through stacked Mamba2 blocks with residual connections
+
+        # Process through stacked Mamba2 blocks (frame-level sequence)
         residual = None
         h_seq = x_seq
 
@@ -824,119 +990,143 @@ class HistoryEncoder(nn.Module):
             h_seq = block(h_seq, residual=residual)
             residual = h_seq  # Update residual for next block
 
+        # Project to final representation
+        h_seq = self.encoder_history_input_proj(h_seq)  # (B, L, D)
+
         return h_seq
 
     def fuse_observations(self, batch: dict[str, Tensor]) -> Tensor:
-        """Function to fuse observations into history vectors.
+        """Extract, process, and POOL spatial tokens per frame for Mamba.
 
-        Processes observation sequences of length n_obs_steps.
-        Processes all cameras and timesteps in a single batched backbone forward pass.
+        Pool BEFORE Mamba to ensure train-inference consistency.
+        Flow: images -> encode -> cross-camera attn -> pool per-frame -> temporal pos
 
         Args:
             batch: Full batch of observations with OBS_IMAGES as stacked tensor (B, L, N_cam, C, H, W)
         Returns:
-            x: (B, L, D) processed history features
+            x: (B, L, D) pooled frame representations ready for Mamba
         """
         # OBS_IMAGES is already stacked: (B, L, N_cam, C, H, W)
         img_stack = batch[OBS_IMAGES]
         batch_size, seq_len, num_cameras, channels, height, width = img_stack.shape
 
-        # Flatten to (N_cam*B*L, C, H, W) for batch processing
-        img_batch = img_stack.reshape(
-            num_cameras * batch_size * seq_len, channels, height, width
-        )
+        # Downsample images for history encoder efficiency if configured
+        img_stack, height, width = self._downsample_images(img_stack, height, width)
 
-        # Convert uint8 to float if needed
-        if img_batch.dtype == torch.uint8:
-            img_batch = img_batch.float().div_(255)
+        # Process images in chunks to reduce peak memory
+        # Image encoder has no temporal dependency, so we can chunk freely
+        max_images_per_chunk = self.config.max_images_per_chunk
+        images_per_timestep = num_cameras * batch_size
+        timesteps_per_chunk = max(1, max_images_per_chunk // images_per_timestep)
 
-        # Convert to channels_last for cuDNN optimization
-        img_batch = img_batch.contiguous(memory_format=torch.channels_last)
+        img_tokens_list = []
+        for t_start in range(0, seq_len, timesteps_per_chunk):
+            t_end = min(t_start + timesteps_per_chunk, seq_len)
 
-        # Single backbone forward pass for all cameras and timesteps
-        raw = self.hist_backbone(img_batch)
-        raw_img_features = raw["feature_map"]
-        img_features = self.spatial_adapter(
-            raw_img_features
-        )  # (num_cameras*batch_size*seq_len, D)
+            # Extract chunk: (B, chunk_len, N_cam, C, H, W)
+            img_chunk = img_stack[:, t_start:t_end]
+            chunk_len = t_end - t_start
 
-        dim_model = img_features.shape[-1]
+            # Flatten to (N_cam*B*chunk_len, C, H, W)
+            img_batch = img_chunk.reshape(num_cameras * batch_size * chunk_len, channels, height, width)
 
-        # Reshape to (N_cam, B, L, D)
-        img_features = img_features.view(num_cameras, batch_size, seq_len, dim_model)
+            # Convert uint8 to float if needed
+            if img_batch.dtype == torch.uint8:
+                img_batch = img_batch.float().div_(255)
 
-        # Stack cameras then cross-camera attention
-        cam_tokens = torch.stack(
-            [img_features[i] for i in range(num_cameras)], dim=2
-        )  # (B, L, num_cameras, D)
-        x = cam_tokens.reshape(
-            batch_size * seq_len, num_cameras, dim_model
-        )  # (B*L, num_cameras, D)
-        x = self.cross_camera_attn(x, x, x)  # (B*L, num_cameras, D)
-        x = x.mean(dim=1).reshape(batch_size, seq_len, dim_model)  # (B, L, D)
-        cam_features_proj = self.encoder_history_input_proj(x)  # (B, L, D)
+            # Convert to channels_last for cuDNN optimization
+            img_batch = img_batch.contiguous(memory_format=torch.channels_last)
 
-        # Cross-modal fusion with robot state if available
-        if self.config.robot_state_feature and OBS_STATE in batch:
-            k = v = self.cross_modal_attn.proj_lowdim(batch[OBS_STATE])  # (B, L, D)
-            q = cam_features_proj  # (B, L, D)
-            x_out = self.cross_modal_attn(q, k, v)  # (B, L, D)
-        else:
-            x_out = cam_features_proj
+            # Encoder forward pass for this chunk (no temporal dependency)
+            chunk_tokens = self.image_encoder(img_batch)  # (N_cam*B*chunk_len, num_tokens, D)
+            img_tokens_list.append(chunk_tokens)
 
-        return x_out
+        # Concatenate all chunks - now we have tokens for all timesteps
+        img_tokens = torch.cat(img_tokens_list, dim=0)  # (N_cam*B*L, num_tokens, D)
 
-    def fuse_one_timestep(self, obs_images: Tensor, obs_state: Tensor = None) -> Tensor:
+        num_tokens_per_img = img_tokens.shape[1]
+        dim_model = img_tokens.shape[-1]
+
+        # Reshape to (N_cam, B, L, num_tokens, D)
+        img_tokens = img_tokens.view(num_cameras, batch_size, seq_len, num_tokens_per_img, dim_model)
+
+        # Combine camera and token dimensions for cross-camera attention
+        # Reshape to (B, L, N_cam*num_tokens, D)
+        cam_tokens = einops.rearrange(img_tokens, "n_cam b l n_tok d -> b l (n_cam n_tok) d")
+
+        # Reshape for attention: (B*L, N_cam*num_tokens, D)
+        num_tokens_per_frame = num_cameras * num_tokens_per_img
+        x = cam_tokens.reshape(batch_size * seq_len, num_tokens_per_frame, dim_model)
+
+        # Cross-camera attention operates on all tokens from all cameras
+        x = self.cross_camera_attn(x, x, x)  # (B*L, N_cam*num_tokens, D)
+
+        # POOL spatial tokens per frame using summary attention
+        x_t = self.summary_attn(x)  # (B*L, D)
+
+        # Reshape to (B, L, D)
+        x_t = x_t.reshape(batch_size, seq_len, dim_model)
+
+        # Add temporal positional embeddings (no spatial - already pooled)
+        # temporal_pos_embed shape is now (1, n_obs_steps, D)
+        temporal_pos = self.temporal_pos_embed[:, :seq_len, :]  # (1, L, D)
+        x_t = x_t + temporal_pos  # (B, L, D)
+
+        return x_t
+
+    def fuse_one_timestep(self, obs_images: Tensor, timestep_idx: int = 0) -> Tensor:
         """Process a single observation timestep for streaming inference.
+
+        Returns a POOLED frame representation to match training (pool before Mamba).
+        Flow: images -> encode -> cross-camera attn -> pool -> temporal pos
 
         Args:
             obs_images: (B, N_cam, C, H, W) images from all cameras at one timestep
-            obs_state: (B, D_state) robot state at one timestep (optional)
+            timestep_idx: Current timestep index for temporal positional embedding
         Returns:
-            x_t: (B, D) fused observation feature for this timestep
+            x_t: (B, D) pooled frame representation ready for Mamba step
         """
         batch_size, num_cameras, channels, height, width = obs_images.shape
 
+        # Downsample images for history encoder efficiency if configured
+        obs_images, height, width = self._downsample_images(obs_images, height, width)
+
         # Flatten cameras and batch for backbone processing
-        img_batch = obs_images.reshape(
-            num_cameras * batch_size, channels, height, width
-        )
+        img_batch = obs_images.reshape(num_cameras * batch_size, channels, height, width)
 
         # Convert uint8 to float if needed
         if img_batch.dtype == torch.uint8:
             img_batch = img_batch.float().div_(255)
 
-        # Convert to channels_last for cuDNN optimization
+        # Convert to channels_last for cuDNN optimization (helps ResNet)
         img_batch = img_batch.contiguous(memory_format=torch.channels_last)
 
-        # Backbone forward pass for all cameras
-        raw = self.hist_backbone(img_batch)
-        raw_img_features = raw["feature_map"]
-        img_features = self.spatial_adapter(raw_img_features)  # (num_cameras*B, D)
+        # Encoder forward pass for all cameras
+        # Returns (N_cam*B, num_tokens, D) where num_tokens=49 for ResNet, 256 for DINOv2
+        img_tokens = self.image_encoder(img_batch)  # (N_cam*B, num_tokens, D)
 
-        dim_model = img_features.shape[-1]
+        num_tokens_per_img = img_tokens.shape[1]
+        dim_model = img_tokens.shape[-1]
 
-        # Reshape to (B, num_cameras, D)
-        img_features = img_features.view(batch_size, num_cameras, dim_model)
+        # Reshape to (B, N_cam, num_tokens, D)
+        img_tokens = img_tokens.view(batch_size, num_cameras, num_tokens_per_img, dim_model)
 
-        # Cross-camera attention
+        # Flatten camera and token dimensions: (B, N_cam*num_tokens, D)
+        img_tokens_flat = img_tokens.reshape(batch_size, num_cameras * num_tokens_per_img, dim_model)
+
+        # Cross-camera attention operates on all tokens from all cameras
         cam_features_fused = self.cross_camera_attn(
-            img_features, img_features, img_features
-        )  # (B, num_cameras, D)
-        cam_features_fused = cam_features_fused.mean(dim=1)  # (B, D)
-        cam_features_proj = self.encoder_history_input_proj(
-            cam_features_fused
-        )  # (B, D)
+            img_tokens_flat, img_tokens_flat, img_tokens_flat
+        )  # (B, N_cam*num_tokens, D)
 
-        # Cross-modal fusion with robot state if available
-        if self.config.robot_state_feature and obs_state is not None:
-            k = v = self.cross_modal_attn.proj_lowdim(
-                obs_state.unsqueeze(1)
-            )  # (B, 1, D)
-            q = cam_features_proj.unsqueeze(1)  # (B, 1, D)
-            x_out = self.cross_modal_attn(q, k, v)  # (B, 1, D)
-            x_out = x_out.squeeze(1)  # (B, D)
-        else:
-            x_out = cam_features_proj
+        # POOL spatial tokens using summary attention (BEFORE Mamba, matches training!)
+        x_t = self.summary_attn(cam_features_fused)  # (B, D)
 
-        return x_out
+        # Add temporal positional embedding (no spatial - already pooled)
+        # Use modular indexing for long-horizon inference
+        temporal_idx = timestep_idx % self.config.n_obs_steps
+        # temporal_pos_embed shape is (1, n_obs_steps, D)
+        temporal_pos = self.temporal_pos_embed[:, temporal_idx, :]  # (1, D)
+        x_t = x_t + temporal_pos  # (B, D)
+
+        return x_t

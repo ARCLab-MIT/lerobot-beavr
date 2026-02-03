@@ -11,12 +11,6 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-try:
-    import dinov2  # noqa: F401
-    DINOV2_AVAILABLE = True
-except ImportError:
-    DINOV2_AVAILABLE = False
-
 from lerobot.policies.act.modeling_act import (
     ACTDecoder,
     ACTEncoder,
@@ -631,126 +625,6 @@ def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tenso
     return torch.from_numpy(sinusoid_table).float()
 
 
-class ImageEncoder(nn.Module):
-    """Base class for image encoders that extract features from images."""
-    
-    def forward(self, images: Tensor) -> Tensor:
-        """Encode images to feature tokens.
-        
-        Args:
-            images: (B, C, H, W) batch of images
-        Returns:
-            (B, num_tokens, D) feature tokens
-        """
-        raise NotImplementedError
-
-
-class ResNetImageEncoder(ImageEncoder):
-    """ResNet-based image encoder with spatial adapter."""
-    
-    def __init__(self, config: MACTConfig):
-        super().__init__()
-        backbone_model = getattr(torchvision.models, config.vision_backbone)(
-            replace_stride_with_dilation=[
-                False,
-                False,
-                config.replace_final_stride_with_dilation,
-            ],
-            weights=config.pretrained_backbone_weights,
-            norm_layer=FrozenBatchNorm2d,
-        )
-        self.backbone = IntermediateLayerGetter(
-            backbone_model, return_layers={"layer4": "feature_map"}
-        )
-        
-        # Spatial adapter to convert feature maps to tokens
-        backbone_out_channels = backbone_model.fc.in_features
-        self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(
-                backbone_out_channels,
-                config.spatial_adapter_hidden_dim,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                config.spatial_adapter_hidden_dim,
-                config.spatial_adapter_output_dim,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(1),
-            nn.Linear(config.spatial_adapter_output_dim, config.dim_model),
-            nn.LayerNorm(config.dim_model),
-            nn.ReLU(inplace=True),
-            nn.Dropout(config.spatial_adapter_dropout),
-        )
-        
-        if config.freeze_history_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-    
-    def forward(self, images: Tensor) -> Tensor:
-        """(B, C, H, W) -> (B, 1, D) - single token per image."""
-        features = self.backbone(images)["feature_map"]
-        token = self.spatial_adapter(features)  # (B, D)
-        return token.unsqueeze(1)  # (B, 1, D)
-
-
-class DinoV2ImageEncoder(ImageEncoder):
-    """DINOv2-based image encoder that preserves spatial patch tokens."""
-    
-    def __init__(self, config: MACTConfig):
-        super().__init__()
-        if not DINOV2_AVAILABLE:
-            raise ImportError(
-                "DINOv2 is not available. Install with: pip install dinov2 or use torch.hub.load"
-            )
-        
-        # Load DINOv2 model from torch hub
-        self.dinov2 = torch.hub.load('facebookresearch/dinov2', config.vision_backbone)
-        
-        # Get embedding dimension based on model variant
-        dinov2_dims = {
-            "dinov2_vits14": 384,
-            "dinov2_vitb14": 768,
-            "dinov2_vitl14": 1024,
-            "dinov2_vitg14": 1536,
-        }
-        self.embed_dim = dinov2_dims.get(config.vision_backbone, 768)
-        
-        # Project to model dimension if needed
-        if self.embed_dim != config.dim_model:
-            self.proj = nn.Linear(self.embed_dim, config.dim_model)
-        else:
-            self.proj = nn.Identity()
-        
-        # Freeze backbone if requested
-        if config.freeze_history_backbone:
-            for param in self.dinov2.parameters():
-                param.requires_grad = False
-    
-    def forward(self, images: Tensor) -> Tensor:
-        """(B, C, H, W) -> (B, num_patches, D) - all spatial patch tokens."""
-        # DINOv2 expects float images in [0, 1]
-        if images.dtype == torch.uint8:
-            images = images.float().div_(255)
-        
-        # Get tokens from DINOv2: (B, num_patches+1, embed_dim)
-        with torch.no_grad() if hasattr(self.dinov2, 'training') and not self.dinov2.training else torch.enable_grad():
-            tokens = self.dinov2.forward_features(images)
-        
-        # Extract patch tokens (excluding CLS token at position 0)
-        patch_tokens = tokens["x_norm_patchtokens"] if isinstance(tokens, dict) else tokens[:, 1:]
-        
-        # Project to model dimension
-        projected = self.proj(patch_tokens)  # (B, num_patches, D)
-        
-        return projected
-
-
 class MambaBlock(nn.Module):
     """A single Mamba2 block with normalization and optional MLP."""
 
@@ -813,19 +687,62 @@ class HistoryEncoder(nn.Module):
 
     def __init__(self, config: MACTConfig):
         super().__init__()
-        self.config = config
-        
         # Stack of Mamba2 blocks controlled by n_mamba2_layers config parameter
         self.blocks = nn.ModuleList(
             [MambaBlock(config, layer_idx=i) for i in range(config.n_mamba2_layers)]
         )
 
-        # Image encoder (ResNet or DINOv2)
+        self.spatial_adapter = nn.Sequential(
+            nn.Conv2d(
+                config.dim_model,
+                config.spatial_adapter_hidden_dim,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.ReLU(),
+            nn.Conv2d(
+                config.spatial_adapter_hidden_dim,
+                config.spatial_adapter_output_dim,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(1),
+            nn.Linear(config.spatial_adapter_output_dim, config.dim_model),  # (B, D)
+            nn.LayerNorm(config.dim_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.spatial_adapter_dropout),
+        )
+
+        self.config = config
+        # Backbone for image feature extraction.
         if self.config.image_features:
-            if config.vision_backbone.startswith("dinov2"):
-                self.image_encoder = DinoV2ImageEncoder(config)
-            else:
-                self.image_encoder = ResNetImageEncoder(config)
+            history_backbone_model = getattr(
+                torchvision.models, config.vision_backbone
+            )(
+                replace_stride_with_dilation=[
+                    False,
+                    False,
+                    config.replace_final_stride_with_dilation,
+                ],
+                weights=config.pretrained_backbone_weights,
+                norm_layer=FrozenBatchNorm2d,
+            )
+            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+            # feature map).
+            # Note: The forward method of this returns a dict: {"feature_map": output}.
+            self.hist_backbone = IntermediateLayerGetter(
+                history_backbone_model, return_layers={"layer4": "feature_map"}
+            )
+            # Expose backbone output channels for consumers
+            self.hist_backbone_out_channels = history_backbone_model.fc.in_features
+            # self.hist_backbone = self.hist_backbone.to(memory_format=torch.channels_last)
+
+            # Freeze the history backbone parameters
+            if config.freeze_history_backbone:
+                for param in self.hist_backbone.parameters():
+                    param.requires_grad = False
 
         self.cross_camera_attn = self.cross_cam_attn = CrossCameraAttention(config)
         self.cross_modal_attn = CrossModalAttention(config)
@@ -933,36 +850,29 @@ class HistoryEncoder(nn.Module):
         if img_batch.dtype == torch.uint8:
             img_batch = img_batch.float().div_(255)
 
-        # Convert to channels_last for cuDNN optimization (helps ResNet)
+        # Convert to channels_last for cuDNN optimization
         img_batch = img_batch.contiguous(memory_format=torch.channels_last)
 
-        # Single encoder forward pass for all cameras and timesteps
-        # Returns (N_cam*B*L, num_tokens, D) where num_tokens=1 for ResNet, 256 for DINOv2
-        img_tokens = self.image_encoder(img_batch)  # (N_cam*B*L, num_tokens, D)
-        
-        num_tokens_per_img = img_tokens.shape[1]
-        dim_model = img_tokens.shape[-1]
+        # Single backbone forward pass for all cameras and timesteps
+        raw = self.hist_backbone(img_batch)
+        raw_img_features = raw["feature_map"]
+        img_features = self.spatial_adapter(
+            raw_img_features
+        )  # (num_cameras*batch_size*seq_len, D)
 
-        # Reshape to (N_cam, B, L, num_tokens, D)
-        img_tokens = img_tokens.view(
-            num_cameras, batch_size, seq_len, num_tokens_per_img, dim_model
-        )
+        dim_model = img_features.shape[-1]
 
-        # Combine camera and token dimensions for cross-camera attention
-        # Reshape to (B, L, N_cam*num_tokens, D)
-        cam_tokens = einops.rearrange(
-            img_tokens, "n_cam b l n_tok d -> b l (n_cam n_tok) d"
-        )
-        
-        # Reshape for attention: (B*L, N_cam*num_tokens, D)
+        # Reshape to (N_cam, B, L, D)
+        img_features = img_features.view(num_cameras, batch_size, seq_len, dim_model)
+
+        # Stack cameras then cross-camera attention
+        cam_tokens = torch.stack(
+            [img_features[i] for i in range(num_cameras)], dim=2
+        )  # (B, L, num_cameras, D)
         x = cam_tokens.reshape(
-            batch_size * seq_len, num_cameras * num_tokens_per_img, dim_model
-        )
-        
-        # Cross-camera attention operates on all tokens from all cameras
-        x = self.cross_camera_attn(x, x, x)  # (B*L, N_cam*num_tokens, D)
-        
-        # Pool across all camera tokens to get one token per timestep
+            batch_size * seq_len, num_cameras, dim_model
+        )  # (B*L, num_cameras, D)
+        x = self.cross_camera_attn(x, x, x)  # (B*L, num_cameras, D)
         x = x.mean(dim=1).reshape(batch_size, seq_len, dim_model)  # (B, L, D)
         cam_features_proj = self.encoder_history_input_proj(x)  # (B, L, D)
 
@@ -996,28 +906,23 @@ class HistoryEncoder(nn.Module):
         if img_batch.dtype == torch.uint8:
             img_batch = img_batch.float().div_(255)
 
-        # Convert to channels_last for cuDNN optimization (helps ResNet)
+        # Convert to channels_last for cuDNN optimization
         img_batch = img_batch.contiguous(memory_format=torch.channels_last)
 
-        # Encoder forward pass for all cameras
-        # Returns (N_cam*B, num_tokens, D) where num_tokens=1 for ResNet, 256 for DINOv2
-        img_tokens = self.image_encoder(img_batch)  # (N_cam*B, num_tokens, D)
-        
-        num_tokens_per_img = img_tokens.shape[1]
-        dim_model = img_tokens.shape[-1]
+        # Backbone forward pass for all cameras
+        raw = self.hist_backbone(img_batch)
+        raw_img_features = raw["feature_map"]
+        img_features = self.spatial_adapter(raw_img_features)  # (num_cameras*B, D)
 
-        # Reshape to (B, N_cam, num_tokens, D)
-        img_tokens = img_tokens.view(batch_size, num_cameras, num_tokens_per_img, dim_model)
-        
-        # Flatten camera and token dimensions: (B, N_cam*num_tokens, D)
-        img_tokens_flat = img_tokens.reshape(batch_size, num_cameras * num_tokens_per_img, dim_model)
+        dim_model = img_features.shape[-1]
 
-        # Cross-camera attention operates on all tokens from all cameras
+        # Reshape to (B, num_cameras, D)
+        img_features = img_features.view(batch_size, num_cameras, dim_model)
+
+        # Cross-camera attention
         cam_features_fused = self.cross_camera_attn(
-            img_tokens_flat, img_tokens_flat, img_tokens_flat
-        )  # (B, N_cam*num_tokens, D)
-        
-        # Pool across all camera tokens
+            img_features, img_features, img_features
+        )  # (B, num_cameras, D)
         cam_features_fused = cam_features_fused.mean(dim=1)  # (B, D)
         cam_features_proj = self.encoder_history_input_proj(
             cam_features_fused

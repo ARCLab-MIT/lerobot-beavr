@@ -76,9 +76,10 @@ class MACTConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 25
+    n_obs_steps: int = 15
     chunk_size: int = 100
-    n_action_steps: int = 100
+    n_action_steps: int = 1
+    observation_stride: int = 5  # Sample every Nth frame (1=all frames, 2=every other, 3=every 3rd, etc.)
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -125,16 +126,20 @@ class MACTConfig(PreTrainedConfig):
 
     # History encoder.
     use_history_encoder: bool = True  # Legacy feature. TODO: Remove this.
-    freeze_history_backbone: bool = False
+    freeze_history_backbone: bool = True
     history_use_mem_eff_path: bool = True
     history_use_mlp: bool = True  # Whether to include MLP in MambaBlocks
     n_mamba2_layers: int = 4
-    n_history_tokens: int = 1  # Number of most recent history tokens used by the model
+    n_history_tokens: int = 15  # Number of most recent history tokens used by the model
+    max_images_per_chunk: int = 64  # Maximum images to process per chunk
+
+    # History encoder image size (for efficiency, downsample images in history encoder)
+    # Set to None to use original image size, or (H, W) tuple to resize
+    # Recommended: (160, 120) for 4x downsample, (224, 224) for ResNet native size
+    history_image_size: tuple[int, int] | None = (224, 224)
 
     # Spatial adapter for camera features
-    spatial_adapter_hidden_dim: int = (
-        512  # Hidden dimension in spatial adapter conv layers
-    )
+    spatial_adapter_hidden_dim: int = 512  # Hidden dimension in spatial adapter conv layers
     spatial_adapter_output_dim: int = 256  # Output dimension before final projection
     spatial_adapter_dropout: float = 0.1  # Dropout rate in spatial adapter
 
@@ -157,10 +162,10 @@ class MACTConfig(PreTrainedConfig):
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
             )
-        if self.n_action_steps > self.chunk_size:
+        if self.n_action_steps > 1:
             raise ValueError(
-                f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
-                f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
+                f"The number of action steps per model invocation must be 1. Got "
+                f"{self.n_action_steps} for `n_action_steps`."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:
@@ -174,13 +179,15 @@ class MACTConfig(PreTrainedConfig):
 
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
-            raise ValueError(
-                "You must provide at least one image or the environment state among the inputs."
-            )
+            raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
     @property
     def observation_delta_indices(self) -> list:
-        return list[int](range(1 - self.n_obs_steps, 1))
+        # Stride-based temporal subsampling:
+        # stride=1: [-59, -58, ..., 0] (60 frames @ 30fps = 2.0s history)
+        # stride=2: [-118, -116, ..., 0] (60 frames @ 15fps effective = 4.0s history)
+        # stride=3: [-177, -174, ..., 0] (60 frames @ 10fps effective = 6.0s history)
+        return list[int](range(1 - self.n_obs_steps * self.observation_stride, 1, self.observation_stride))
 
     @property
     def action_delta_indices(self) -> list:
