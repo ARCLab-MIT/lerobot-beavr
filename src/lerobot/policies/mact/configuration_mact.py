@@ -76,10 +76,11 @@ class MACTConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 15
+    n_obs_steps: int = 30
+    n_history_tokens: int = 30  # Number of most recent history tokens used by the model
     chunk_size: int = 100
     n_action_steps: int = 1
-    observation_stride: int = 5  # Sample every Nth frame (1=all frames, 2=every other, 3=every 3rd, etc.)
+    observation_stride: int = 6  # Sample every Nth frame (1=all frames, 2=every other, 3=every 3rd, etc.)
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -105,7 +106,7 @@ class MACTConfig(PreTrainedConfig):
     # Note: Although the original ACT implementation has 7 for `n_decoder_layers`, there is a bug in the code
     # that means only the first layer is used. Here we match the original implementation by setting this to 1.
     # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
-    n_decoder_layers: int = 1
+    n_decoder_layers: int = 6
     # VAE.
     use_vae: bool = True
     latent_dim: int = 32
@@ -113,11 +114,11 @@ class MACTConfig(PreTrainedConfig):
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
-    temporal_ensemble_coeff: float | None = None
+    temporal_ensemble_coeff: float | None = 0.01
 
     # Training and loss computation.
     dropout: float = 0.1
-    kl_weight: float = 10.0
+    kl_weight: float = 0.1
 
     # Training preset
     optimizer_lr: float = 1e-5
@@ -125,12 +126,18 @@ class MACTConfig(PreTrainedConfig):
     optimizer_lr_backbone: float = 1e-5
 
     # History encoder.
-    use_history_encoder: bool = True  # Legacy feature. TODO: Remove this.
-    freeze_history_backbone: bool = True
+    freeze_history_backbone: bool = False
     history_use_mem_eff_path: bool = True
     history_use_mlp: bool = True  # Whether to include MLP in MambaBlocks
-    n_mamba2_layers: int = 4
-    n_history_tokens: int = 15  # Number of most recent history tokens used by the model
+    n_mamba2_layers: int = 6
+
+    # Spatial-then-temporal architecture
+    # Step 1: Spatial transformer over patches per frame
+    # Step 2: Pool to n_spatial_tokens per frame
+    # Step 3: Mamba over temporal sequence
+    n_spatial_attn_layers: int = 4  # Transformer layers for per-frame spatial attention
+    n_spatial_tokens: int = 16  # Summary tokens per frame after spatial pooling
+
     max_images_per_chunk: int = 64  # Maximum images to process per chunk
 
     # History encoder image size (for efficiency, downsample images in history encoder)
@@ -142,11 +149,6 @@ class MACTConfig(PreTrainedConfig):
     spatial_adapter_hidden_dim: int = 512  # Hidden dimension in spatial adapter conv layers
     spatial_adapter_output_dim: int = 256  # Output dimension before final projection
     spatial_adapter_dropout: float = 0.1  # Dropout rate in spatial adapter
-
-    # RoPE.
-    # rope_partial_rotary_factor: float = 0.5
-    # rope_theta: float = 10000.0
-    capture_attention_weights: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -166,6 +168,11 @@ class MACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"The number of action steps per model invocation must be 1. Got "
                 f"{self.n_action_steps} for `n_action_steps`."
+            )
+        if self.n_obs_steps != self.n_history_tokens:
+            raise ValueError(
+                f"The number of observation steps must equal the number of history tokens. Got "
+                f"{self.n_obs_steps} for `n_obs_steps` and {self.n_history_tokens} for `n_history_tokens`."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:

@@ -18,6 +18,9 @@ try:
 except ImportError:
     DINOV2_AVAILABLE = False
 
+from mamba_ssm.modules.block import Block
+from mamba_ssm.modules.mamba2 import Mamba2
+
 from lerobot.policies.act.modeling_act import (
     ACTDecoder,
     ACTEncoder,
@@ -25,11 +28,7 @@ from lerobot.policies.act.modeling_act import (
     ACTTemporalEnsembler,
 )
 from lerobot.policies.mact.configuration_mact import MACTConfig
-from lerobot.policies.mact.mamba2 import (
-    CrossCameraAttention,
-    Mamba2,
-    Mamba2Config,
-)
+from lerobot.policies.mact.cross_attention import CrossCameraAttention
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -171,21 +170,23 @@ class MACTPolicy(PreTrainedPolicy):
 
         # Only update history on stride boundaries (matches training)
         if self._inference_step_counter % self.config.observation_stride == 0:
-            # Get pooled frame representation (pool BEFORE Mamba, matches training)
+            # Get spatial tokens (no pooling yet - step() handles that after Mamba)
             x_t = self.history_encoder.fuse_one_timestep(
                 model_batch[OBS_IMAGES],
                 timestep_idx=self._strided_obs_idx,
-            )  # (B, D)
-            # Process through Mamba (one step per frame, matches training)
-            h_t, self._mamba_cache = self.history_encoder.step(x_t, self._mamba_cache)
+            )  # (B, N, D)
+            # Process through Mamba (one step per patch, then pool)
+            h_t, self._mamba_cache = self.history_encoder.step(
+                x_t, self._mamba_cache, timestep_idx=self._strided_obs_idx
+            )
 
-            self._history_tokens.append(h_t.detach())
+            self._history_tokens.append(h_t.detach())  # h_t is (B, k, D)
             self._strided_obs_idx += 1
 
         self._inference_step_counter += 1
         history_tokens = list(self._history_tokens)
-        # Shape: (B, n_tokens, D)
-        model_batch[HISTORY_TOKEN] = torch.stack(history_tokens, dim=1)
+        # Each entry is (B, k, D), concatenate to (B, n_frames*k, D)
+        model_batch[HISTORY_TOKEN] = torch.cat(history_tokens, dim=1)
 
         # Get action predictions from model
         actions = self.model(model_batch)[0]
@@ -206,11 +207,12 @@ class MACTPolicy(PreTrainedPolicy):
         # Prepare batch for history encoder
 
         # Input: images (B, L, n_cameras, C, H, W), states (B, L, D_state)
-        # Output: h_seq (B, L, D)
-        h_seq = self.history_encoder.forward(batch)  # (B, L, D)
+        # Output: (B, L*k, D) where k = n_spatial_tokens
+        h_seq = self.history_encoder.forward(batch)
 
-        # Extract the last n_history_tokens for decoder conditioning
-        n_tokens = min(self.config.n_history_tokens, h_seq.shape[1])
+        # Extract the last n_history_tokens * n_spatial_tokens for decoder conditioning
+        tokens_per_frame = self.config.n_spatial_tokens
+        n_tokens = min(self.config.n_history_tokens * tokens_per_frame, h_seq.shape[1])
         batch[HISTORY_TOKEN] = h_seq[:, -n_tokens:, :]  # (B, n_tokens, D)
 
         # Create model batch with only the most recent timestep
@@ -320,8 +322,10 @@ class MACT(nn.Module):
             # Projection layer from the VAE encoder's output to the latent distribution's parameter space.
             self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
             # Fixed sinusoidal positional embedding for the input to the VAE encoder. Unsqueeze for batch
-            # dimension.
-            num_input_token_encoder = 1 + config.chunk_size
+            # dimension. Includes: cls + (robot_state) + chunk_size + n_history_tokens * n_spatial_tokens
+            num_input_token_encoder = (
+                1 + config.chunk_size + config.n_history_tokens * config.n_spatial_tokens
+            )
             if self.config.robot_state_feature:
                 num_input_token_encoder += 1
             self.register_buffer(
@@ -380,7 +384,8 @@ class MACT(nn.Module):
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
         # Positional embeddings for history tokens (used as encoder inputs)
-        self.history_pos_embed = nn.Embedding(config.n_history_tokens, config.dim_model)
+        n_hist_pos_embed = config.n_history_tokens * config.n_spatial_tokens
+        self.history_pos_embed = nn.Embedding(n_hist_pos_embed, config.dim_model)
 
         # Final action regression head on the output of the transformer's decoder.
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
@@ -454,6 +459,8 @@ class MACT(nn.Module):
             else:
                 raise ValueError(f"Unexpected ACTION shape: {action_input.shape}")
 
+            history_embed = batch[HISTORY_TOKEN]  # (B, n_tokens, D)
+
             action_embed = self.vae_encoder_action_input_proj(action_input)  # (B, chunk_size, D)
 
             if self.config.robot_state_feature:
@@ -461,26 +468,33 @@ class MACT(nn.Module):
                     cls_embed,
                     robot_state_embed,
                     action_embed,
-                ]  # (B, S+2, D)
+                    history_embed,
+                ]  # (B, 1+1+chunk_size+n_tokens, D)
             else:
-                vae_encoder_input = [cls_embed, action_embed]
+                vae_encoder_input = [cls_embed, action_embed, history_embed]  # (B, 1+chunk_size+n_tokens, D)
             vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
 
             # Prepare fixed positional embedding.
             # Note: detach() shouldn't be necessary but leaving it the same as the original code just in case.
-            pos_embed = self.vae_encoder_pos_enc.clone().detach()  # (1, S+2, D)
+            pos_embed = self.vae_encoder_pos_enc.clone().detach()  # (1, 1+chunk_size+n_tokens, D)
 
-            # Prepare key padding mask for the transformer encoder. We have 1 or 2 extra tokens at the start of the
-            # sequence depending whether we use the input states or not (cls and robot state)
+            # Prepare key padding mask for the transformer encoder.
+            # Tokens: [cls, (robot_state), actions, history_tokens]
+            # cls, robot_state, and history tokens are never padded (False)
             # False means not a padding token.
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
                 device=batch[OBS_STATE].device,
             )
+            history_is_pad = torch.full(
+                (batch_size, history_embed.shape[1]),
+                False,
+                device=batch[OBS_STATE].device,
+            )
             key_padding_mask = torch.cat(
-                [cls_joint_is_pad, batch["action_is_pad"]], axis=1
-            )  # (bs, seq+1 or 2)
+                [cls_joint_is_pad, batch["action_is_pad"], history_is_pad], axis=1
+            )  # (bs, 1 or 2 + chunk_size + n_history_tokens)
 
             # Forward pass through VAE encoder to get the latent PDF parameters.
             cls_token_out = self.vae_encoder(
@@ -732,68 +746,64 @@ class DinoV2ImageEncoder(ImageEncoder):
         return projected
 
 
-class MambaBlock(nn.Module):
-    """A single Mamba2 block with normalization and optional MLP."""
+def _create_mamba_block(config: MACTConfig, layer_idx: int) -> Block:
+    """Create a Mamba2 block using the official Block wrapper.
 
-    def __init__(self, config: MACTConfig, layer_idx: int):
-        super().__init__()
-        mamba_config = Mamba2Config(
-            dim_model=config.dim_model,
-            n_heads=config.n_heads,
-            dtype=torch.float32,
+    Args:
+        config: MACT configuration
+        layer_idx: Index of this layer in the stack
+    Returns:
+        Official Block wrapping a Mamba2 mixer with optional MLP
+    """
+    d = config.dim_model
+
+    # Mamba2 SSM head dimension (NOT the same as attention headdim).
+    # With expand=2: d_inner = 2*512 = 1024, headdim=128 → nheads=8.
+    mamba_headdim = 128
+    mamba_d_state = 512
+
+    mixer_cls = lambda dim: Mamba2(  # noqa: E731
+        d_model=dim,
+        d_state=mamba_d_state,
+        headdim=mamba_headdim,
+        ngroups=1,
+        dt_max=0.02,
+        layer_idx=layer_idx,
+    )
+
+    if config.history_use_mlp:
+        mlp_cls = lambda dim: nn.Sequential(  # noqa: E731
+            nn.Linear(dim, config.dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.dim_feedforward, dim),
         )
-        self.mixer = Mamba2(config=mamba_config)
-        self.norm = nn.LayerNorm(config.dim_model)
+    else:
+        mlp_cls = nn.Identity
 
-        # Optional MLP for additional expressiveness (similar to transformer FFN)
-        if config.history_use_mlp:
-            self.mlp = nn.Sequential(
-                nn.Linear(config.dim_model, config.dim_feedforward),
-                nn.ReLU(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.dim_feedforward, config.dim_model),
-            )
-
-        else:
-            self.mlp = None
-
-    def forward(self, x: Tensor, residual: Tensor | None = None) -> Tensor:
-        """Forward pass through Mamba block.
-
-        Args:
-            x: (B, L, D) input tensor
-            residual: Optional residual connection from previous block
-        Returns:
-            (B, L, D) output tensor
-        """
-        if residual is None:
-            residual = x
-
-        # Pre-norm
-        x_norm = self.norm(residual)
-
-        # Mamba2 mixer
-        y = self.mixer(x_norm)
-
-        # Residual connection
-        out = y + residual
-
-        # Optional MLP
-        if self.mlp is not None:
-            out = self.mlp(self.norm(out)) + out
-
-        return out
+    return Block(
+        dim=d,
+        mixer_cls=mixer_cls,
+        mlp_cls=mlp_cls,
+        norm_cls=nn.LayerNorm,
+        fused_add_norm=False,
+    )
 
 
-class SummaryAttention(nn.Module):
-    """Attention-based summarization of spatial tokens into a single frame representation.
+class MultiQueryPooling(nn.Module):
+    """Multi-query attention pooling for spatial tokens.
 
-    Uses a learnable query token to attend over all spatial tokens and produce a summary.
+    Uses k learnable queries to preserve spatial structure instead of
+    compressing to a single token. This helps prevent mode collapse by
+    retaining more fine-grained spatial information.
     """
 
     def __init__(self, config: MACTConfig):
         super().__init__()
-        self.query = nn.Parameter(torch.randn(1, 1, config.dim_model) * (1 / np.sqrt(config.dim_model)))
+        self.n_queries = config.n_spatial_tokens
+        self.queries = nn.Parameter(
+            torch.randn(1, self.n_queries, config.dim_model) * (1 / np.sqrt(config.dim_model))
+        )
         self.attn = nn.MultiheadAttention(
             config.dim_model,
             num_heads=config.n_heads,
@@ -803,16 +813,96 @@ class SummaryAttention(nn.Module):
         self.norm = nn.LayerNorm(config.dim_model)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Summarize spatial tokens using attention.
+        """Summarize spatial tokens using multi-query attention.
 
         Args:
             x: (B, N_tokens, D) spatial tokens
         Returns:
-            (B, D) summarized representation
+            (B, n_queries, D) summarized representations preserving spatial structure
         """
-        query = self.query.expand(x.shape[0], -1, -1)  # (B, 1, D)
-        summary, _ = self.attn(query, x, x)  # (B, 1, D)
-        return self.norm(query + summary).squeeze(1)  # (B, D)
+        queries = self.queries.expand(x.shape[0], -1, -1)  # (B, k, D)
+        summary, _ = self.attn(queries, x, x)  # (B, k, D)
+        return self.norm(queries + summary)  # (B, k, D)
+
+
+class SpatialTransformer(nn.Module):
+    """Per-frame spatial self-attention over patches.
+
+    Processes spatial relationships within each frame independently,
+    preserving temporal structure. Used in spatial-then-temporal architecture.
+    """
+
+    def __init__(self, config: MACTConfig):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.dim_model,
+            nhead=config.n_heads,
+            dim_feedforward=config.dim_model * 4,
+            dropout=config.dropout,
+            batch_first=True,
+            norm_first=True,  # Pre-LN for stability
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.n_spatial_attn_layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply spatial self-attention to each frame independently.
+
+        Args:
+            x: (B, L, N, D) where L=frames, N=patches per frame
+        Returns:
+            (B, L, N, D) with spatial attention applied per-frame
+        """
+        B, L, N, D = x.shape  # noqa: N806
+        # Reshape to process all frames as a single batch
+        x = x.view(B * L, N, D)  # (B*L, N, D)
+        x = self.encoder(x)  # Self-attention over patches
+        return x.view(B, L, N, D)  # (B, L, N, D)
+
+
+class PositionalEmbedding3D(nn.Module):
+    """3D positional embeddings combining spatial (patch position) + temporal (frame index).
+
+    Spatial embeddings are learned per-patch position within a frame.
+    Temporal embeddings are learned per-frame position within the sequence.
+    Both are added to the input tokens via broadcasting.
+    """
+
+    def __init__(self, n_patches: int, n_frames: int, dim_model: int):
+        super().__init__()
+        # Learnable spatial embeddings: one per patch position
+        self.spatial = nn.Parameter(torch.randn(1, 1, n_patches, dim_model) * 0.02)
+        # Learnable temporal embeddings: one per frame position
+        self.temporal = nn.Parameter(torch.randn(1, n_frames, 1, dim_model) * 0.02)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Add 3D positional embeddings to spatiotemporal tokens.
+
+        Args:
+            x: (B, L, N, D) spatiotemporal tokens where L=frames, N=patches
+        Returns:
+            (B, L, N, D) with positional embeddings added
+        """
+        B, L, N, D = x.shape  # noqa: N806
+        # Slice to actual sequence/patch lengths (handles variable sizes)
+        spatial = self.spatial[:, :, :N, :]  # (1, 1, N, D)
+        temporal = self.temporal[:, :L, :, :]  # (1, L, 1, D)
+        return x + spatial + temporal  # Broadcasting adds both
+
+    def get_embeddings_for_timestep(self, n_patches: int, timestep_idx: int) -> tuple[Tensor, Tensor]:
+        """Get spatial and temporal embeddings for a single timestep (inference).
+
+        Args:
+            n_patches: Number of patches for this frame
+            timestep_idx: Current timestep index (for temporal embedding)
+        Returns:
+            spatial: (1, N, D) spatial embeddings
+            temporal: (1, 1, D) temporal embedding for this timestep
+        """
+        spatial = self.spatial[:, 0, :n_patches, :]  # (1, N, D)
+        # Use modular indexing for long-horizon inference
+        temporal_idx = timestep_idx % self.temporal.shape[1]
+        temporal = self.temporal[:, temporal_idx : temporal_idx + 1, 0, :]  # (1, 1, D)
+        return spatial, temporal
 
 
 class HistoryEncoder(nn.Module):
@@ -827,7 +917,9 @@ class HistoryEncoder(nn.Module):
         self.config = config
 
         # Stack of Mamba2 blocks controlled by n_mamba2_layers config parameter
-        self.blocks = nn.ModuleList([MambaBlock(config, layer_idx=i) for i in range(config.n_mamba2_layers)])
+        self.blocks = nn.ModuleList(
+            [_create_mamba_block(config, layer_idx=i) for i in range(config.n_mamba2_layers)]
+        )
 
         # Image encoder (ResNet or DINOv2)
         if self.config.image_features:
@@ -840,13 +932,32 @@ class HistoryEncoder(nn.Module):
 
         self.encoder_history_input_proj = nn.Linear(config.dim_model, config.dim_model)
 
-        # Summary attention for pooling spatial tokens BEFORE Mamba
-        self.summary_attn = SummaryAttention(config)
+        # Spatial-then-temporal architecture:
+        # Step 1: Spatial transformer (self-attention over patches per frame)
+        self.spatial_transformer = SpatialTransformer(config)
+        # Step 2: Multi-query pooling (compress patches to n_spatial_tokens per frame)
+        self.spatial_pool = MultiQueryPooling(config)
 
-        # Temporal positional embeddings for frame-level Mamba
-        # Shape: (1, n_obs_steps, D) - one embedding per frame position
-        self.temporal_pos_embed = nn.Parameter(
-            torch.randn(1, config.n_obs_steps, config.dim_model) * (1 / np.sqrt(config.dim_model))
+        # Compute number of spatial patches based on vision backbone
+        # ResNet with 224x224 input produces 7x7=49 tokens
+        # DINOv2 with 224x224 input produces 16x16=256 tokens (patch_size=14)
+        if config.vision_backbone.startswith("dinov2"):
+            # DINOv2 patch size is 14, so 224/14 = 16 patches per side
+            img_h, img_w = config.history_image_size or (224, 224)
+            n_patches_per_img = (img_h // 14) * (img_w // 14)
+        else:
+            # ResNet produces 7x7 feature map regardless of input size (due to adaptive pooling)
+            n_patches_per_img = 49
+
+        # Total patches per frame = n_cameras * n_patches_per_image
+        n_cameras = len(config.image_features) if config.image_features else 1
+        self.n_patches_per_frame = n_cameras * n_patches_per_img
+
+        # 3D positional embeddings: spatial (per patch) + temporal (per frame)
+        self.pos_embed_3d = PositionalEmbedding3D(
+            n_patches=self.n_patches_per_frame,
+            n_frames=config.n_obs_steps,
+            dim_model=config.dim_model,
         )
 
     def _downsample_images(
@@ -913,98 +1024,135 @@ class HistoryEncoder(nn.Module):
     def init_cache(self, batch_size: int, dtype: torch.dtype) -> list[tuple[Tensor, Tensor]]:
         # Return a list of caches - one for each Mamba2 block
         return [
-            block.mixer.allocate_inference_cache(batch_size=batch_size, dtype=dtype) for block in self.blocks
+            block.allocate_inference_cache(batch_size=batch_size, max_seqlen=1, dtype=dtype)
+            for block in self.blocks
         ]
 
     @torch.no_grad()
     def step(
         self,
-        x_t: Tensor,  # (B, D) - pooled frame representation
+        x_t: Tensor,  # (B, N, D) - spatial tokens for this frame
         cache: list[tuple[Tensor, Tensor]],
+        timestep_idx: int = 0,
     ) -> tuple[Tensor, list[tuple[Tensor, Tensor]]]:
-        """Run one Mamba step for a pooled frame representation (inference).
+        """Run one frame through spatial-then-temporal pipeline (inference).
 
-        This matches the training path exactly: pool BEFORE Mamba, one step per frame.
+        Flow: spatial attention → pool → Mamba steps for k pooled tokens.
+        Matches training: pool BEFORE Mamba, so Mamba sees k tokens per frame.
 
         Args:
-            x_t: (B, D) - pooled frame representation (spatial tokens already pooled)
+            x_t: (B, N, D) - spatial tokens for this frame (N patches)
             cache: list of (conv_state, ssm_state) tuples - one per block
+            timestep_idx: Current timestep index for temporal positional embedding
         Returns:
-            h_t: (B, D) - processed frame representation and updated cache list
+            h_t: (B, k, D) - pooled & temporally processed tokens for this frame
+            updated_cache: Updated cache list
         """
-        hidden = x_t  # (B, D)
-        updated_cache = []
-        residual = None
+        batch_size, n_patches, dim_model = x_t.shape
 
-        for i, block in enumerate(self.blocks):
-            conv_state, ssm_state = cache[i]
+        # Add 3D positional embeddings for this timestep
+        spatial_embed, temporal_embed = self.pos_embed_3d.get_embeddings_for_timestep(n_patches, timestep_idx)
+        x_t = x_t + spatial_embed + temporal_embed  # (B, N, D)
 
-            # Initialize or update residual (matches MambaBlock.forward exactly)
-            if residual is None:
+        # Step 1: Spatial self-attention over patches (treat as single frame)
+        x_t = x_t.unsqueeze(1)  # (B, 1, N, D) - add frame dim for SpatialTransformer
+        x_t = self.spatial_transformer(x_t)  # (B, 1, N, D)
+        x_t = x_t.squeeze(1)  # (B, N, D)
+
+        # Step 2: Pool patches → k summary tokens
+        pooled = self.spatial_pool(x_t)  # (B, k, D)
+
+        # Step 3: Feed k pooled tokens through Mamba sequentially
+        outputs = []
+        for token_idx in range(pooled.shape[1]):
+            hidden = pooled[:, token_idx, :]  # (B, D)
+            residual = None
+
+            for block_idx, block in enumerate(self.blocks):
+                conv_state, ssm_state = cache[block_idx]
+
+                if residual is None:
+                    residual = hidden
+
+                # Pre-norm (official Block uses block.norm for first norm)
+                hidden_norm = block.norm(residual.to(dtype=block.norm.weight.dtype))
+
+                # Mamba2 mixer step
+                y_t, new_conv, new_ssm = block.mixer.step(hidden_norm.unsqueeze(1), conv_state, ssm_state)
+                y_t = y_t.squeeze(1)  # (B, D)
+
+                # Residual connection
+                hidden = y_t + residual
+
+                # Optional MLP (official Block uses block.norm2 for MLP norm)
+                if block.mlp is not None:
+                    hidden = block.mlp(block.norm2(hidden)) + hidden
+
+                cache[block_idx] = (new_conv, new_ssm)
                 residual = hidden
-            # Note: In MambaBlock.forward, residual is just assigned, not accumulated
 
-            # Pre-norm (matches MambaBlock.forward)
-            hidden_norm = block.norm(residual.to(dtype=block.norm.weight.dtype))
+            outputs.append(hidden)
 
-            # Mamba2 mixer step - expects (B, 1, D) for single token
-            y_t, new_conv, new_ssm = block.mixer.step(hidden_norm.unsqueeze(1), conv_state, ssm_state)
-            y_t = y_t.squeeze(1)  # (B, D)
+        # Stack and project: (B, k, D)
+        h_t = torch.stack(outputs, dim=1)
+        h_t = self.encoder_history_input_proj(h_t)  # (B, k, D)
 
-            # Residual connection (matches MambaBlock.forward: out = y + residual)
-            hidden = y_t + residual
-
-            # Optional MLP (matches MambaBlock.forward exactly)
-            if block.mlp is not None:
-                hidden = block.mlp(block.norm(hidden)) + hidden
-
-            updated_cache.append((new_conv, new_ssm))
-            residual = hidden  # Update residual for next block
-
-        h_t = hidden  # (B, D)
-
-        # Apply projection (matches training forward path)
-        h_t = self.encoder_history_input_proj(h_t)  # (B, D)
-
-        return h_t, updated_cache
+        return h_t, cache
 
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
-        """Process a full sequence using fused Mamba2 forward (training).
+        """Process a full observation sequence (training).
 
-        Architecture: Pool spatial tokens BEFORE Mamba to ensure train-inference consistency.
-        Flow: images -> encode -> cross-camera attn -> pool per-frame -> temporal pos -> Mamba -> proj
+        Flow: encode → spatial attention → pool → Mamba → project
 
         Args:
             batch: Full batch of observations and actions
         Returns:
-            h_seq: (B, L, D) processed history features
+            h_seq: (B, L*k, D) where k = n_spatial_tokens
         """
-        # Get pooled frame representations
-        x_seq = self.fuse_observations(batch)  # (B, L, D)
+        # Get spatial tokens per frame
+        x = self.fuse_observations(batch)  # (B, L, N, D)
+        batch_size, seq_len, n_patches, dim_model = x.shape
 
-        # Process through stacked Mamba2 blocks (frame-level sequence)
+        # Add 3D positional embeddings (spatial + temporal)
+        x = self.pos_embed_3d(x)  # (B, L, N, D)
+
+        # Step 1: Spatial self-attention per frame
+        x = self.spatial_transformer(x)  # (B, L, N, D)
+
+        # Step 2: Pool each frame's patches → k summary tokens
+        h_frames = []
+        for t in range(seq_len):
+            h_t = self.spatial_pool(x[:, t, :, :])  # (B, k, D)
+            h_frames.append(h_t)
+        x = torch.stack(h_frames, dim=1)  # (B, L, k, D)
+
+        # Step 3: Flatten for Mamba temporal processing
+        x = einops.rearrange(x, "b l k d -> b (l k) d")  # (B, L*k, D)
+
+        # Step 4: Mamba processes temporal relationships
+        # Official Block.forward returns (hidden_states, residual) tuples.
+        # hidden_states is the mixer output, residual is the accumulated skip connection.
+        # After the final block, combine them to get the full output.
         residual = None
-        h_seq = x_seq
-
         for block in self.blocks:
-            h_seq = block(h_seq, residual=residual)
-            residual = h_seq  # Update residual for next block
+            x, residual = block(x, residual=residual)
+        x = x + residual  # Combine final mixer output with skip connection
 
         # Project to final representation
-        h_seq = self.encoder_history_input_proj(h_seq)  # (B, L, D)
+        h_seq = self.encoder_history_input_proj(x)  # (B, L*k, D)
 
         return h_seq
 
     def fuse_observations(self, batch: dict[str, Tensor]) -> Tensor:
-        """Extract, process, and POOL spatial tokens per frame for Mamba.
+        """Extract and process spatial tokens per frame for spatiotemporal Mamba.
 
-        Pool BEFORE Mamba to ensure train-inference consistency.
-        Flow: images -> encode -> cross-camera attn -> pool per-frame -> temporal pos
+        Returns spatial tokens WITHOUT pooling - pooling happens AFTER Mamba.
+        Flow: images -> encode -> cross-camera attn -> return spatial tokens
 
         Args:
             batch: Full batch of observations with OBS_IMAGES as stacked tensor (B, L, N_cam, C, H, W)
         Returns:
-            x: (B, L, D) pooled frame representations ready for Mamba
+            x: (B, L, N, D) spatial tokens per frame ready for Mamba
         """
         # OBS_IMAGES is already stacked: (B, L, N_cam, C, H, W)
         img_stack = batch[OBS_IMAGES]
@@ -1061,30 +1209,22 @@ class HistoryEncoder(nn.Module):
         # Cross-camera attention operates on all tokens from all cameras
         x = self.cross_camera_attn(x, x, x)  # (B*L, N_cam*num_tokens, D)
 
-        # POOL spatial tokens per frame using summary attention
-        x_t = self.summary_attn(x)  # (B*L, D)
+        # Reshape to (B, L, N, D) - NO POOLING, return spatial tokens
+        x = x.reshape(batch_size, seq_len, num_tokens_per_frame, dim_model)
 
-        # Reshape to (B, L, D)
-        x_t = x_t.reshape(batch_size, seq_len, dim_model)
-
-        # Add temporal positional embeddings (no spatial - already pooled)
-        # temporal_pos_embed shape is now (1, n_obs_steps, D)
-        temporal_pos = self.temporal_pos_embed[:, :seq_len, :]  # (1, L, D)
-        x_t = x_t + temporal_pos  # (B, L, D)
-
-        return x_t
+        return x
 
     def fuse_one_timestep(self, obs_images: Tensor, timestep_idx: int = 0) -> Tensor:
         """Process a single observation timestep for streaming inference.
 
-        Returns a POOLED frame representation to match training (pool before Mamba).
-        Flow: images -> encode -> cross-camera attn -> pool -> temporal pos
+        Returns spatial tokens (NOT pooled) for step() to process per-patch.
+        Flow: images -> encode -> cross-camera attn -> return spatial tokens
 
         Args:
             obs_images: (B, N_cam, C, H, W) images from all cameras at one timestep
-            timestep_idx: Current timestep index for temporal positional embedding
+            timestep_idx: Current timestep index (unused here, used in step())
         Returns:
-            x_t: (B, D) pooled frame representation ready for Mamba step
+            x_t: (B, N, D) spatial tokens ready for step()
         """
         batch_size, num_cameras, channels, height, width = obs_images.shape
 
@@ -1115,18 +1255,9 @@ class HistoryEncoder(nn.Module):
         img_tokens_flat = img_tokens.reshape(batch_size, num_cameras * num_tokens_per_img, dim_model)
 
         # Cross-camera attention operates on all tokens from all cameras
-        cam_features_fused = self.cross_camera_attn(
+        x_t = self.cross_camera_attn(
             img_tokens_flat, img_tokens_flat, img_tokens_flat
         )  # (B, N_cam*num_tokens, D)
 
-        # POOL spatial tokens using summary attention (BEFORE Mamba, matches training!)
-        x_t = self.summary_attn(cam_features_fused)  # (B, D)
-
-        # Add temporal positional embedding (no spatial - already pooled)
-        # Use modular indexing for long-horizon inference
-        temporal_idx = timestep_idx % self.config.n_obs_steps
-        # temporal_pos_embed shape is (1, n_obs_steps, D)
-        temporal_pos = self.temporal_pos_embed[:, temporal_idx, :]  # (1, D)
-        x_t = x_t + temporal_pos  # (B, D)
-
+        # Return spatial tokens (NO POOLING - step() will handle that after Mamba)
         return x_t

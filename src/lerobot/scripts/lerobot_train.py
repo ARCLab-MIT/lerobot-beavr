@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import gc
 import logging
 import time
 from contextlib import nullcontext
@@ -21,6 +22,7 @@ from pprint import pformat
 from typing import Any
 
 import torch
+import torch.cuda
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
@@ -505,6 +507,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+
+                # Clear evaluation caches and free memory to prevent OOM when transitioning back to training
+                accelerator.unwrap_model(policy).reset()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             accelerator.wait_for_everyone()
 

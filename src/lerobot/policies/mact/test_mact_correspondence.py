@@ -79,10 +79,11 @@ def test_history_encoder_equivalence():
         for t in range(n_obs):
             obs_t = images[:, t]
             x_t = policy.history_encoder.fuse_one_timestep(obs_t, timestep_idx=t)
-            h_t, cache = policy.history_encoder.step(x_t, cache)
-            h_seq_recurrent.append(h_t)
+            h_t, cache = policy.history_encoder.step(x_t, cache, timestep_idx=t)
+            h_seq_recurrent.append(h_t)  # h_t is now (B, k, D) with multi-query pooling
 
-    h_seq_recurrent = torch.stack(h_seq_recurrent, dim=1)
+    # Use cat instead of stack since each h_t is (B, k, D)
+    h_seq_recurrent = torch.cat(h_seq_recurrent, dim=1)
 
     max_diff = (h_seq_parallel - h_seq_recurrent).abs().max().item()
     cos_sim = torch.nn.functional.cosine_similarity(
@@ -205,10 +206,10 @@ def test_full_pipeline_correspondence():
             "observation.images.laptop": images[:, t, 0],
             "observation.state": states[:, t],
         }
-        action_inference = policy.select_action(batch)
+        policy.select_action(batch)
 
-    # Get accumulated history
-    history_inference = torch.stack(list(policy._history_tokens), dim=1)
+    # Get accumulated history - each entry is (B, k, D), concatenate to (B, L*k, D)
+    history_inference = torch.cat(list(policy._history_tokens), dim=1)
 
     # Compare histories
     history_diff = (history_train - history_inference).abs().max().item()
@@ -216,7 +217,7 @@ def test_full_pipeline_correspondence():
         history_train.flatten(), history_inference.flatten(), dim=0
     ).item()
 
-    print(f"  History comparison:")
+    print("  History comparison:")
     print(f"    Train shape: {history_train.shape}")
     print(f"    Inference shape: {history_inference.shape}")
     print(f"    Max diff: {history_diff:.2e}")
@@ -237,7 +238,7 @@ def test_full_pipeline_correspondence():
         actions_train.flatten(), actions_from_inf_history.flatten(), dim=0
     ).item()
 
-    print(f"\n  Action comparison (from model with respective histories):")
+    print("\n  Action comparison (from model with respective histories):")
     print(f"    Max diff: {action_diff:.2e}")
     print(f"    Cosine sim: {action_cos:.6f}")
 
@@ -251,7 +252,7 @@ def test_full_pipeline_correspondence():
         actions_same_history, _ = policy.model(model_batch_same_history)
 
     same_history_diff = (actions_train - actions_same_history).abs().max().item()
-    print(f"\n  Sanity check (model with SAME history):")
+    print("\n  Sanity check (model with SAME history):")
     print(f"    Max diff: {same_history_diff:.2e}")
 
     history_passed = history_diff < 1e-3
@@ -326,7 +327,7 @@ def test_action_at_each_step():
 
         training_actions.append(action.clone())
 
-    print(f"  Comparing actions at each step:")
+    print("  Comparing actions at each step:")
     all_diffs = []
     for t in range(n_obs):
         diff = (inference_actions[t] - training_actions[t]).abs().max().item()
