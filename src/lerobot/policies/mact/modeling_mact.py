@@ -755,34 +755,20 @@ def _create_mamba_block(config: MACTConfig, layer_idx: int) -> Block:
     Returns:
         Official Block wrapping a Mamba2 mixer with optional MLP
     """
-    d = config.dim_model
-
-    # Mamba2 SSM head dimension (NOT the same as attention headdim).
-    # With expand=2: d_inner = 2*512 = 1024, headdim=128 → nheads=8.
-    mamba_headdim = 128
-    mamba_d_state = 512
-
     mixer_cls = lambda dim: Mamba2(  # noqa: E731
         d_model=dim,
-        d_state=mamba_d_state,
-        headdim=mamba_headdim,
-        ngroups=1,
-        dt_max=0.02,
         layer_idx=layer_idx,
     )
 
-    if config.history_use_mlp:
-        mlp_cls = lambda dim: nn.Sequential(  # noqa: E731
-            nn.Linear(dim, config.dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.dim_feedforward, dim),
-        )
-    else:
-        mlp_cls = nn.Identity
+    mlp_cls = lambda dim: nn.Sequential(  # noqa: E731
+        nn.Linear(dim, config.dim_feedforward),
+        nn.ReLU(),
+        nn.Dropout(config.dropout),
+        nn.Linear(config.dim_feedforward, dim),
+    )
 
     return Block(
-        dim=d,
+        dim=config.dim_model,
         mixer_cls=mixer_cls,
         mlp_cls=mlp_cls,
         norm_cls=nn.LayerNorm,
@@ -1138,8 +1124,10 @@ class HistoryEncoder(nn.Module):
             x, residual = block(x, residual=residual)
         x = x + residual  # Combine final mixer output with skip connection
 
-        # Project to final representation
-        h_seq = self.encoder_history_input_proj(x)  # (B, L*k, D)
+        # Project to final representation (Per-frame pooling to match step() behavior)
+        x = einops.rearrange(x, "b (l k) d -> (b l) k d", l=seq_len)
+        h_seq = self.encoder_history_input_proj(x)
+        h_seq = einops.rearrange(h_seq, "(b l) k d -> b (l k) d", l=seq_len)
 
         return h_seq
 
@@ -1187,30 +1175,23 @@ class HistoryEncoder(nn.Module):
 
             # Encoder forward pass for this chunk (no temporal dependency)
             chunk_tokens = self.image_encoder(img_batch)  # (N_cam*B*chunk_len, num_tokens, D)
-            img_tokens_list.append(chunk_tokens)
 
-        # Concatenate all chunks - now we have tokens for all timesteps
-        img_tokens = torch.cat(img_tokens_list, dim=0)  # (N_cam*B*L, num_tokens, D)
+            # Reshape chunk tokens to (batch_size, chunk_len, num_cameras, num_tokens, D)
+            num_tokens_per_img = chunk_tokens.shape[1]
+            dim_model = chunk_tokens.shape[-1]
+            chunk_tokens = chunk_tokens.view(
+                batch_size, chunk_len, num_cameras, num_tokens_per_img, dim_model
+            )
 
-        num_tokens_per_img = img_tokens.shape[1]
-        dim_model = img_tokens.shape[-1]
+            # Apply cross-camera attention per timestep within the chunk
+            for t_in_chunk in range(chunk_len):
+                cam_tokens = chunk_tokens[:, t_in_chunk]  # (B, N_cam, n_tok, D)
+                cam_tokens = einops.rearrange(cam_tokens, "b n_cam n_tok d -> b (n_cam n_tok) d")
+                cam_tokens = self.cross_camera_attn(cam_tokens, cam_tokens, cam_tokens)
+                img_tokens_list.append(cam_tokens)
 
-        # Reshape to (N_cam, B, L, num_tokens, D)
-        img_tokens = img_tokens.view(num_cameras, batch_size, seq_len, num_tokens_per_img, dim_model)
-
-        # Combine camera and token dimensions for cross-camera attention
-        # Reshape to (B, L, N_cam*num_tokens, D)
-        cam_tokens = einops.rearrange(img_tokens, "n_cam b l n_tok d -> b l (n_cam n_tok) d")
-
-        # Reshape for attention: (B*L, N_cam*num_tokens, D)
-        num_tokens_per_frame = num_cameras * num_tokens_per_img
-        x = cam_tokens.reshape(batch_size * seq_len, num_tokens_per_frame, dim_model)
-
-        # Cross-camera attention operates on all tokens from all cameras
-        x = self.cross_camera_attn(x, x, x)  # (B*L, N_cam*num_tokens, D)
-
-        # Reshape to (B, L, N, D) - NO POOLING, return spatial tokens
-        x = x.reshape(batch_size, seq_len, num_tokens_per_frame, dim_model)
+        # Combine all timesteps: (B, L, N, D)
+        x = torch.stack(img_tokens_list, dim=1)
 
         return x
 

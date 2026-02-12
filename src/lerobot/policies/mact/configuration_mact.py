@@ -127,8 +127,6 @@ class MACTConfig(PreTrainedConfig):
 
     # History encoder.
     freeze_history_backbone: bool = False
-    history_use_mem_eff_path: bool = True
-    history_use_mlp: bool = True  # Whether to include MLP in MambaBlocks
     n_mamba2_layers: int = 6
 
     # Spatial-then-temporal architecture
@@ -138,10 +136,9 @@ class MACTConfig(PreTrainedConfig):
     n_spatial_attn_layers: int = 4  # Transformer layers for per-frame spatial attention
     n_spatial_tokens: int = 16  # Summary tokens per frame after spatial pooling
 
-    max_images_per_chunk: int = 64  # Maximum images to process per chunk
-
     # History encoder image size (for efficiency, downsample images in history encoder)
     # Set to None to use original image size, or (H, W) tuple to resize
+    max_images_per_chunk: int = 64  # Maximum images to process per chunk
     # Recommended: (160, 120) for 4x downsample, (224, 224) for ResNet native size
     history_image_size: tuple[int, int] | None = (224, 224)
 

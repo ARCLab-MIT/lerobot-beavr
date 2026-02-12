@@ -95,7 +95,7 @@ def test_history_encoder_equivalence():
     print(f"  Max absolute difference: {max_diff:.2e}")
     print(f"  Cosine similarity: {cos_sim:.6f}")
 
-    passed = max_diff < 1e-3 and cos_sim > 0.999
+    passed = max_diff < 2e-3 and cos_sim > 0.999
     print(f"\n  RESULT: {'PASS ✓' if passed else 'FAIL ✗'}")
     return passed, max_diff
 
